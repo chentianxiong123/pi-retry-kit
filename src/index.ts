@@ -5,25 +5,22 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 // ============================================================================
-// quota-retry —— 请求层无条件静默重试（"邪修"版，包装 provider stream）
+// retry —— 请求层无条件静默重试（包装 provider stream）
 //
 // 为什么需要它：
 //   pi 内置 retry 用 isRetryableAssistantError 分类，insufficient_quota / quota
-//   exceeded / billing 等被判定为"不可重试"，直接快速失败。但对免费额度模型，
-//   上游是固定时间/固定量限流，任何报错都只是"正在被限"，重试就有意义。
+//   exceeded / billing 等被判定为"不可重试"，直接快速失败。但免费额度模型的上游
+//   是固定时间/固定量限流，任何报错都只是"正在被限"，重试就有意义。
 //
 // 本扩展做什么：
 //   在 session_start / model_select 时包装当前 provider 的 stream / streamSimple，
 //   把每个请求包进一个重试循环：遇到任何 error 事件（429 / 5xx / 网络 / 超时 /
-//   insufficient_quota / quota exceeded / ...）且尚未产出内容时，按退避等待后
-//   在请求层重新发起，pi 和模型完全无感，不发任何消息。
+//   insufficient_quota / quota exceeded / context overflow / ...）且尚未产出内容时，
+//   按退避等待后在请求层重新发起，pi 和模型完全无感，不发任何消息。
 //
-// 唯一的硬例外（不做无脑重试）：
-//   1. abort —— 用户按 Esc 取消，尊重用户意志
-//   2. context overflow（prompt too long）—— 重试无意义，快速失败交给 pi 的
-//      compaction 机制恢复
+// 唯一的硬例外：abort —— 用户按 Esc 取消是用户意志，不是错误，尊重并立即停止。
 //
-// 配置：~/.pi/quota-retry.json（不存在则用默认值，见 DEFAULT_CONFIG）
+// 配置：~/.pi/retry.json（向后兼容：不存在时回退读取 ~/.pi/quota-retry.json）
 // ============================================================================
 
 interface QuotaRetryConfig {
@@ -39,7 +36,7 @@ interface QuotaRetryConfig {
 	maxTotalWaitMs: number;
 	/** 尊重服务端 retry-after 头 */
 	respectRetryAfter: boolean;
-	/** prompt too long 等上下文溢出快速失败（不重试，交给 compaction） */
+	/** 上下文溢出（prompt too long）也进入重试循环；true 则快速失败交给 compaction */
 	contextOverflowFastFail: boolean;
 	/** 重试期间在状态栏显示进度 */
 	showStatus: boolean;
@@ -52,16 +49,18 @@ const DEFAULT_CONFIG: QuotaRetryConfig = {
 	maxDelayMs: 60000,
 	maxTotalWaitMs: 0,
 	respectRetryAfter: true,
-	contextOverflowFastFail: true,
+	contextOverflowFastFail: false, // 一切都重试（默认；如遇 prompt too long 空转可关掉此项）
 	showStatus: true,
 };
 
-const CONFIG_PATH = join(homedir(), ".pi", "quota-retry.json");
+const CONFIG_PATH = join(homedir(), ".pi", "retry.json");
+const LEGACY_CONFIG_PATH = join(homedir(), ".pi", "quota-retry.json");
 
 function loadConfig(): QuotaRetryConfig {
 	try {
-		if (existsSync(CONFIG_PATH)) {
-			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<QuotaRetryConfig>;
+		const primary = existsSync(CONFIG_PATH) ? CONFIG_PATH : LEGACY_CONFIG_PATH;
+		if (existsSync(primary)) {
+			const raw = JSON.parse(readFileSync(primary, "utf8")) as Partial<QuotaRetryConfig>;
 			return { ...DEFAULT_CONFIG, ...raw };
 		}
 	} catch {
@@ -203,12 +202,13 @@ export default function (pi: ExtensionAPI) {
 						? (lastErrorEvent.error.errorMessage ?? "")
 						: "";
 
-				// 硬例外 1：上下文溢出 → 快速失败，交给 pi 的 compaction
+				// 可选项：上下文溢出快速失败（默认关闭 —— 一切都重试。若配置开启，
+				// prompt too long 会立即上交，由 pi 的 compaction 机制恢复）
 				if (config.contextOverflowFastFail && isContextOverflowText(errText)) {
 					out.push(lastErrorEvent);
 					return;
 				}
-				// 硬例外 2：用户取消 → 尊重意志，不再重试
+				// 唯一硬例外：用户取消 → 尊重意志，不再重试
 				if (options?.signal?.aborted) {
 					out.push(lastErrorEvent);
 					return;
@@ -230,10 +230,10 @@ export default function (pi: ExtensionAPI) {
 						? lastRetryAfterMs
 						: Math.min(config.baseDelayMs * 2 ** Math.min(attempt - 1, 6), config.maxDelayMs);
 				stats.retried++;
-				if (config.showStatus) {
+			if (config.showStatus) {
 					ctx.ui.setStatus(
-						"quota-retry",
-						`上游限流，静默重试 #${attempt}（等 ${Math.round(delay / 1000)}s）`,
+						"retry",
+						`上游不稳定，静默重试 #${attempt}（等 ${Math.round(delay / 1000)}s）`,
 					);
 				}
 				await sleep(delay, options?.signal);
@@ -281,12 +281,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---- 状态/统计命令 ----
-	pi.registerCommand("quota-retry", {
-		description: "Show quota-retry config & session stats",
+	pi.registerCommand("retry", {
+		description: "Show retry config & session stats",
 		handler: async (_args, ctx) => {
 			ctx.ui.notify(
-				`quota-retry: ${config.enabled ? "on" : "off"}` +
-					`（maxAttempts=${config.maxAttempts}, baseDelay=${config.baseDelayMs}ms, maxDelay=${config.maxDelayMs}ms）` +
+				`retry: ${config.enabled ? "on" : "off"}` +
+					`（maxAttempts=${config.maxAttempts}, baseDelay=${config.baseDelayMs}ms, maxDelay=${config.maxDelayMs}ms, overflowFastFail=${config.contextOverflowFastFail}）` +
 					` | 本会话：请求 ${stats.attempts}，重试 ${stats.retried}，救回 ${stats.recovered}，放弃 ${stats.gaveUp}`,
 				"info",
 			);
