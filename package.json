@@ -1,7 +1,7 @@
 {
   "name": "pi-retry",
   "private": false,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Retry everything for pi. Silent, unconditional retry at the provider request layer — wraps provider stream, retries 429 / quota / 5xx / network / overflow errors without touching the model context or sending any messages. Policy-configurable: which errors to retry, backoff, retry-after respect, limits.",
   "keywords": ["pi-package", "retry", "quota", "rate-limit", "extension"],

@@ -260,7 +260,8 @@ export default function (pi: ExtensionAPI) {
 		let attempt = 0;
 
 		(async () => {
-			while (true) {
+			try {
+				while (true) {
 				attempt++;
 				stats.attempts++;
 				let emitted = false;
@@ -354,6 +355,10 @@ export default function (pi: ExtensionAPI) {
 					out.push(lastErrorEvent);
 					return;
 				}
+				}
+			} finally {
+				// 流结束（无论成败）：清除状态栏残留
+				if (config.showStatus) ctx.ui.setStatus("pi-retry", undefined);
 			}
 		})().catch(() => {
 			out.end();
