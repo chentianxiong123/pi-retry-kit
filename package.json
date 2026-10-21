@@ -1,0 +1,21 @@
+{
+  "name": "pi-extension-quota-retry",
+  "private": false,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Unconditional silent retry at the provider request layer — bypasses pi's retryable-error classifier, retries quota/limit/5xx/network errors in the background without touching the model context.",
+  "keywords": ["pi-package", "retry", "quota", "rate-limit", "extension"],
+  "scripts": {
+    "build": "echo 'nothing to build (jiti loads TS directly)'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2"
+  }
+}
