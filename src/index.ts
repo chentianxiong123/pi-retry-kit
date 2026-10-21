@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 // ============================================================================
-// retry —— 请求层无条件静默重试（包装 provider stream）
+// pi-retry —— 请求层无条件静默重试（包装 provider stream）
 //
 // 为什么需要它：
 //   pi 内置 retry 用 isRetryableAssistantError 分类，insufficient_quota / quota
@@ -14,59 +14,135 @@ import { homedir } from "node:os";
 //
 // 本扩展做什么：
 //   在 session_start / model_select 时包装当前 provider 的 stream / streamSimple，
-//   把每个请求包进一个重试循环：遇到任何 error 事件（429 / 5xx / 网络 / 超时 /
-//   insufficient_quota / quota exceeded / context overflow / ...）且尚未产出内容时，
-//   按退避等待后在请求层重新发起，pi 和模型完全无感，不发任何消息。
+//   把每个请求包进重试循环：错误且尚未产出内容时，按退避等待后在请求层重新发起，
+//   pi 和模型完全无感，不发任何消息。
 //
-// 唯一的硬例外：abort —— 用户按 Esc 取消是用户意志，不是错误，尊重并立即停止。
+// 重试策略（mode）：
+//   - "all"        —— 一切错误都重试（默认，用户哲学"一切都重试"）
+//   - "allowlist"  —— 只有命中 matchStatus / matchText 的错误才重试
+//   - "denylist"   —— 命中 matchStatus / matchText 的错误不重试，其余都重试
 //
-// 配置：~/.pi/retry.json（向后兼容：不存在时回退读取 ~/.pi/quota-retry.json）
+// 唯一硬例外：abort —— 用户按 Esc 取消是用户意志，不是错误，永不重试。
+//
+// 配置：~/.pi/pi-retry.json（兼容旧 ~/.pi/retry.json、~/.pi/quota-retry.json）
 // ============================================================================
 
-interface QuotaRetryConfig {
+type RetryMode = "all" | "allowlist" | "denylist";
+
+interface RetryConfig {
 	/** 总开关 */
 	enabled: boolean;
-	/** 单个请求的最大尝试次数（含首次）。1 = 不重试 */
+	/** 重试策略："all" = 一切重试；"allowlist" = 只重试命中的；"denylist" = 命中的不重试 */
+	mode: RetryMode;
+	/** HTTP 状态码匹配（allowlist/denylist 模式下生效） */
+	matchStatus: number[];
+	/** 错误文本正则匹配，正则字符串数组（allowlist/denylist 模式下生效） */
+	matchText: string[];
+	/** 单个请求最大尝试次数（含首次），1 = 不重试 */
 	maxAttempts: number;
-	/** 指数退避基础延迟（ms） */
-	baseDelayMs: number;
-	/** 单次等待上限（ms），含 retry-after 上限 */
-	maxDelayMs: number;
 	/** 单请求累计等待上限（ms），0 = 不限制 */
 	maxTotalWaitMs: number;
+	backoff: {
+		/** 指数退避基础延迟（ms） */
+		baseDelayMs: number;
+		/** 单次等待上限（ms），含 retry-after 上限 */
+		maxDelayMs: number;
+		/** 指数倍数（默认 2：base, base*2, base*4, ...） */
+		multiplier: number;
+		/** 抖动比例 0-1（避免集体重试风暴；0 = 无抖动） */
+		jitter: number;
+	};
 	/** 尊重服务端 retry-after 头 */
 	respectRetryAfter: boolean;
-	/** 上下文溢出（prompt too long）也进入重试循环；true 则快速失败交给 compaction */
-	contextOverflowFastFail: boolean;
-	/** 重试期间在状态栏显示进度 */
+	/** 上下文溢出（prompt too long）也重试（默认 true = 一切都重试） */
+	retryOnOverflow: boolean;
+	/** 重试期间状态栏显示进度 */
 	showStatus: boolean;
 }
 
-const DEFAULT_CONFIG: QuotaRetryConfig = {
+const DEFAULT_CONFIG: RetryConfig = {
 	enabled: true,
+	mode: "all",
+	matchStatus: [408, 429, 500, 502, 503, 504, 524],
+	matchText: [
+		"insufficient_quota",
+		"quota.*(?:exceeded|limit|reached)",
+		"out of budget",
+		"rate.?limit",
+		"too many requests",
+		"overloaded",
+		"server.?error",
+		"service.?unavailable",
+		"internal.?error",
+		"connection.*(?:refused|lost|reset)",
+		"fetch failed",
+		"timeout",
+		"socket hang up",
+	],
 	maxAttempts: 20,
-	baseDelayMs: 3000,
-	maxDelayMs: 60000,
 	maxTotalWaitMs: 0,
+	backoff: {
+		baseDelayMs: 3000,
+		maxDelayMs: 60000,
+		multiplier: 2,
+		jitter: 0.1,
+	},
 	respectRetryAfter: true,
-	contextOverflowFastFail: false, // 一切都重试（默认；如遇 prompt too long 空转可关掉此项）
+	retryOnOverflow: true,
 	showStatus: true,
 };
 
-const CONFIG_PATH = join(homedir(), ".pi", "retry.json");
-const LEGACY_CONFIG_PATH = join(homedir(), ".pi", "quota-retry.json");
+const CONFIG_PATHS = [
+	join(homedir(), ".pi", "pi-retry.json"),
+	join(homedir(), ".pi", "retry.json"),
+	join(homedir(), ".pi", "quota-retry.json"),
+];
 
-function loadConfig(): QuotaRetryConfig {
-	try {
-		const primary = existsSync(CONFIG_PATH) ? CONFIG_PATH : LEGACY_CONFIG_PATH;
-		if (existsSync(primary)) {
-			const raw = JSON.parse(readFileSync(primary, "utf8")) as Partial<QuotaRetryConfig>;
-			return { ...DEFAULT_CONFIG, ...raw };
+function loadConfig(): { config: RetryConfig; compiled: RegExp[] } {
+	let raw: Partial<RetryConfig> | undefined;
+	for (const p of CONFIG_PATHS) {
+		try {
+			if (existsSync(p)) {
+				raw = JSON.parse(readFileSync(p, "utf8"));
+				break;
+			}
+		} catch {
+			// 损坏则尝试下一个
 		}
-	} catch {
-		// 配置损坏时用默认值
 	}
-	return { ...DEFAULT_CONFIG };
+	const config = normalize(raw);
+	const compiled = config.matchText.map((p) => {
+		try {
+			return new RegExp(p, "i");
+		} catch {
+			return /$^/; // 无效正则永不命中
+		}
+	});
+	return { config, compiled };
+}
+
+/** 兼容 v0.1/v0.2 旧格式（顶层 baseDelayMs/maxDelayMs/contextOverflowFastFail） */
+function normalize(raw?: Partial<RetryConfig>): RetryConfig {
+	if (!raw) return structuredClone(DEFAULT_CONFIG);
+	if (!raw.backoff || typeof raw.backoff !== "object") raw.backoff = {};
+	const cfg = {
+		...DEFAULT_CONFIG,
+		...raw,
+		backoff: { ...DEFAULT_CONFIG.backoff, ...raw.backoff },
+	} as RetryConfig;
+
+	// 旧格式顶层字段映射
+	const legacy = raw as Record<string, unknown> & { backoff?: Record<string, unknown> };
+	if (typeof legacy.baseDelayMs === "number" && legacy.backoff?.baseDelayMs === undefined) {
+		cfg.backoff.baseDelayMs = legacy.baseDelayMs as number;
+	}
+	if (typeof legacy.maxDelayMs === "number" && legacy.backoff?.maxDelayMs === undefined) {
+		cfg.backoff.maxDelayMs = legacy.maxDelayMs as number;
+	}
+	if (typeof legacy.contextOverflowFastFail === "boolean") {
+		cfg.retryOnOverflow = !legacy.contextOverflowFastFail;
+	}
+	return cfg;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,14 +183,46 @@ function makeErrorEvent(message: string): AssistantMessageEvent {
 	};
 }
 
+/** 按配置判定"这个错误是否该重试" */
+function shouldRetry(
+	status: number | undefined,
+	errorText: string,
+	cfg: RetryConfig,
+	compiled: RegExp[],
+): boolean {
+	if (cfg.mode === "all") return true;
+	const hit =
+		(status !== undefined && cfg.matchStatus.includes(status)) ||
+		compiled.some((re) => re.test(errorText));
+	return cfg.mode === "allowlist" ? hit : !hit;
+}
+
 // ---------------------------------------------------------------------------
 // 主扩展
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	const config = loadConfig();
+	const { config, compiled } = loadConfig();
 	const wrappedProviders = new Set<string>();
 	const stats = { attempts: 0, retried: 0, recovered: 0, gaveUp: 0 };
+
+	/** 计算退避延迟（含抖动） */
+	function computeDelay(attempt: number, retryAfterMs: number): number {
+		let delay: number;
+		if (config.respectRetryAfter && retryAfterMs > 0) {
+			delay = retryAfterMs;
+		} else {
+			delay =
+				config.backoff.baseDelayMs *
+				config.backoff.multiplier ** Math.min(attempt - 1, 10);
+		}
+		delay = Math.min(delay, config.backoff.maxDelayMs);
+		if (config.backoff.jitter > 0) {
+			const j = config.backoff.jitter * (Math.random() * 2 - 1); // ±jitter
+			delay = Math.max(0, Math.round(delay * (1 + j)));
+		}
+		return delay;
+	}
 
 	/**
 	 * 把原 provider 的 stream 调用包进重试循环，返回一个新的
@@ -127,18 +235,20 @@ export default function (pi: ExtensionAPI) {
 	): AssistantMessageEventStream {
 		const out = createAssistantMessageEventStream();
 		let lastRetryAfterMs = 0;
+		let lastStatus: number | undefined;
 
-		// 注入 onResponse：捕获 429 的 retry-after，供退避决策使用
+		// 注入 onResponse：捕获 HTTP status 与 retry-after，供判定与退避使用
 		const origOnResponse = options?.onResponse;
 		const wrappedOptions = options
 			? {
 					...options,
 					onResponse: (resp: ProviderResponse, model: unknown) => {
+						lastStatus = resp?.status;
 						if (config.respectRetryAfter && resp?.status === 429) {
 							const ra = resp.headers?.["retry-after"];
 							const secs = ra ? parseInt(String(ra), 10) : NaN;
 							if (Number.isFinite(secs) && secs > 0) {
-								lastRetryAfterMs = Math.min(secs * 1000, config.maxDelayMs);
+								lastRetryAfterMs = Math.min(secs * 1000, config.backoff.maxDelayMs);
 							}
 						}
 						return origOnResponse?.(resp, model);
@@ -202,14 +312,19 @@ export default function (pi: ExtensionAPI) {
 						? (lastErrorEvent.error.errorMessage ?? "")
 						: "";
 
-				// 可选项：上下文溢出快速失败（默认关闭 —— 一切都重试。若配置开启，
-				// prompt too long 会立即上交，由 pi 的 compaction 机制恢复）
-				if (config.contextOverflowFastFail && isContextOverflowText(errText)) {
+				// 唯一硬例外：用户取消 → 尊重意志，永不重试
+				if (options?.signal?.aborted) {
 					out.push(lastErrorEvent);
 					return;
 				}
-				// 唯一硬例外：用户取消 → 尊重意志，不再重试
-				if (options?.signal?.aborted) {
+				// 上下文溢出按配置（默认重试；设 retryOnOverflow=false 则快速失败给 compaction）
+				if (!config.retryOnOverflow && isContextOverflowText(errText)) {
+					out.push(lastErrorEvent);
+					return;
+				}
+				// 策略判定：什么情况重试 / 哪些重试
+				if (!shouldRetry(lastStatus, errText, config, compiled)) {
+					stats.gaveUp++;
 					out.push(lastErrorEvent);
 					return;
 				}
@@ -225,15 +340,13 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// ---- 退避等待后重试 ----
-				const delay =
-					config.respectRetryAfter && lastRetryAfterMs > 0
-						? lastRetryAfterMs
-						: Math.min(config.baseDelayMs * 2 ** Math.min(attempt - 1, 6), config.maxDelayMs);
+				const delay = computeDelay(attempt, lastRetryAfterMs);
 				stats.retried++;
-			if (config.showStatus) {
+				if (config.showStatus) {
+					const statusHint = lastStatus !== undefined ? ` (HTTP ${lastStatus})` : "";
 					ctx.ui.setStatus(
-						"retry",
-						`上游不稳定，静默重试 #${attempt}（等 ${Math.round(delay / 1000)}s）`,
+						"pi-retry",
+						`静默重试 #${attempt}${statusHint}（等 ${Math.round(delay / 1000)}s）`,
 					);
 				}
 				await sleep(delay, options?.signal);
@@ -281,12 +394,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---- 状态/统计命令 ----
-	pi.registerCommand("retry", {
-		description: "Show retry config & session stats",
+	pi.registerCommand("pi-retry", {
+		description: "Show pi-retry config & session stats",
 		handler: async (_args, ctx) => {
 			ctx.ui.notify(
-				`retry: ${config.enabled ? "on" : "off"}` +
-					`（maxAttempts=${config.maxAttempts}, baseDelay=${config.baseDelayMs}ms, maxDelay=${config.maxDelayMs}ms, overflowFastFail=${config.contextOverflowFastFail}）` +
+				`pi-retry: ${config.enabled ? "on" : "off"} | mode=${config.mode} | ` +
+					`maxAttempts=${config.maxAttempts} | base=${config.backoff.baseDelayMs}ms x${config.backoff.multiplier} ` +
+					`max=${config.backoff.maxDelayMs}ms jitter=${config.backoff.jitter} | ` +
+					`overflow=${config.retryOnOverflow ? "retry" : "fast-fail"}` +
+					(config.mode !== "all"
+						? ` | ${config.mode === "allowlist" ? "仅重试" : "不重试"}: ` +
+							`status[${config.matchStatus.join(",")}] text[${config.matchText.join(" | ")}]`
+						: "") +
 					` | 本会话：请求 ${stats.attempts}，重试 ${stats.retried}，救回 ${stats.recovered}，放弃 ${stats.gaveUp}`,
 				"info",
 			);
