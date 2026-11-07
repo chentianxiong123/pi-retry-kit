@@ -1,199 +1,145 @@
 # pi-retry-kit
 
-**提效工具包：上游请求「错误」与「首字」双维度的静默重试，一个包搞定。**
+> **pi-resilience** —— 一个插件，三重静默防护：**静默重试 + 首字看门狗 + 熔断器/自动切模型**。
+>
+> 包装 provider 的 `stream`/`streamSimple`，在**请求层**内部重试/切换。全程**无感**（不发消息、不注入、不依赖 pi 内置 retry）、**无缝**（切备用模型时透传同一个对话上下文）。pi 和模型全程无感知。
 
-pi 的扩展工具包，内置多个**提效扩展**，主打**无感重试**——pi 和模型全程不感知、不发任何消息。
+## 为什么需要它
 
-## 内置扩展
+pi 内置 retry 只按「错误」分类重试，且把 `insufficient_quota` / `quota exceeded` / `billing` 等判为**不可重试**直接快速失败；也处理不了「没报错但半天不吐第一个字」的排队/冷启动问题。本插件把整个重试/切换搬到 provider 请求层，**静默**地：
 
-| 扩展 | 触发维度 | 干什么 |
-|---|---|---|
-| **pi-retry** | **错误** | 429 / `insufficient_quota` / 5xx / 网络 / 超时 / context overflow —— 一切报错都静默重试，绕过 pi 内核「配额类错误不可重试」判定 |
-| **pi-ttft** | **时间** | **首字太久**：首个真实 token 超过 `firstTokenTimeoutMs` 未出现 → abort 并静默重试；空响应也重试 |
-| **pi-breaker** | **熔断** | 某模型连续失败 → **熔断**（暂停使用 `resetTimeoutMs`），并**自动切到 `fallbackModels` 备用链**；临时错(network/timeout)用 5s 短冷却 |
-
-两者互补、可叠加：**pi-retry 管「报错就重试」，pi-ttft 管「不报错但半天不吐字就重试」**，合成「错误 + 首字」全覆盖。
+- **重试**：一切报错（配额/429/5xx/网络/超时/overflow）都重试；
+- **首字看门狗**：`firstTokenTimeoutMs` 内无首个真实 token → abort 并重试；空响应也重试；
+- **熔断 + 自动切模型**：某模型连续失败（重试耗尽仍失败 = 判死刑）→ **熔断**该模型 `resetTimeoutMs`，并**自动切到 `fallbackModels` 备用链**（备用模型同样走完整重试 + 透传上下文）。
 
 ## 安装
 
 ```bash
-pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
+pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
 ```
 
-安装后 `/reload` 生效。查看配置与统计：`/pi-retry`、`/pi-ttft`
+> 或本地：`pi -e ./pi-retry-kit`。
 
-## 为什么是「工具包」而不是每扩展一个仓库
+## 配置 `~/.pi/pi-resilience.json`
 
-- **好维护**：一个 git 仓库、一个 package.json、一份 README，共享骨架；历史一路保留。
-- **内置多扩展**：`pi` 清单里列多个 extension 文件，一次安装全部生效；以后加扩展只需丢一个文件 + 加一行。
-- **配置仍独立**：每个扩展读各自配置文件，互不干扰——
-  - pi-retry：`~/.pi/pi-retry.json`（旧版 `~/.pi/retry.json`、`~/.pi/quota-retry.json` 兼容）
-  - pi-ttft：`~/.pi/pi-ttft.json`
-
-## pi-retry 配置（错误维度）
-
-`~/.pi/pi-retry.json`：
+一个扁平 JSON，分节 `retry` / `ttft` / `breaker` / `fallback`，**每节可独立开关**（`enabled: false`）。
 
 ```json
 {
   "enabled": true,
-  "mode": "all",
-  "matchStatus": [408, 429, 500, 502, 503, 504, 524],
-  "matchText": ["insufficient_quota", "quota.*(?:exceeded|limit|reached)", "rate.?limit", "too many requests", "fetch failed"],
-  "maxAttempts": 20,
-  "maxTotalWaitMs": 0,
-  "backoff": { "baseDelayMs": 3000, "maxDelayMs": 60000, "multiplier": 2, "jitter": 0.1 },
-  "respectRetryAfter": true,
-  "retryOnOverflow": true,
-  "showStatus": true
+  "showStatus": true,
+  "retry": {
+    "enabled": true,
+    "mode": "all",
+    "maxAttempts": 20,
+    "maxTotalWaitMs": 0,
+    "backoff": { "baseDelayMs": 3000, "maxDelayMs": 60000, "multiplier": 2, "jitter": 0.1 },
+    "respectRetryAfter": true,
+    "retryOnOverflow": true
+  },
+  "ttft": {
+    "enabled": true,
+    "firstTokenTimeoutMs": 20000,
+    "retryOnEmpty": true
+  },
+  "breaker": {
+    "enabled": true,
+    "failureThreshold": 1,
+    "resetTimeoutMs": 120000,
+    "cooldownMs": 60000
+  },
+  "fallback": {
+    "models": [
+      { "provider": "anthropic", "model": "claude-haiku-4-5" }
+    ],
+    "maxAttempts": 8
+  }
 }
 ```
 
+### retry（错误静默重试）
+
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `mode` | `"all"` | `all` 一切重试 / `allowlist` 只重试命中 / `denylist` 命中不重试 |
-| `matchStatus` / `matchText` | — | allowlist/denylist 模式下判定命中的状态码 / 错误文本正则 |
-| `maxAttempts` | `20` | 单请求最大尝试次数（含首次），`1` = 不重试 |
+| `mode` | `all` | `all` 一切重试；`allowlist` 只重试命中的；`denylist` 命中的不重试 |
+| `matchStatus` / `matchText` | 见下 | `allowlist`/`denylist` 模式下的匹配（HTTP 状态 / 错误文本正则） |
+| `maxAttempts` | `20` | 主模型单请求最大尝试次数（含首次） |
 | `maxTotalWaitMs` | `0` | 单请求累计等待上限（ms），`0` = 不限 |
 | `backoff` | 3000/60000/2/0.1 | 基础延迟 / 单次上限 / 指数倍数 / 抖动 |
 | `respectRetryAfter` | `true` | 尊重服务端 `retry-after` 头 |
-| `retryOnOverflow` | `true` | `false` 时 prompt too long 快速失败交给 compaction |
-| `showStatus` | `true` | 状态栏显示 `静默重试 #n (HTTP 429)（等 Xs）` |
+| `retryOnOverflow` | `true` | 上下文溢出也重试（`false` = 快速失败给 compaction） |
 
-## pi-ttft 配置（首字/时间维度）
-
-`~/.pi/pi-ttft.json`：
-
-```json
-{
-  "enabled": true,
-  "firstTokenTimeoutMs": 20000,
-  "retryOnEmpty": true,
-  "maxAttempts": 20,
-  "maxTotalWaitMs": 0,
-  "backoff": { "baseDelayMs": 2000, "maxDelayMs": 60000, "multiplier": 2, "jitter": 0.1 },
-  "models": { "anthropic/claude*": { "firstTokenTimeoutMs": 45000 } },
-  "showStatus": true
-}
-```
+### ttft（首字看门狗）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `firstTokenTimeoutMs` | `20000` | 首字阈值（ms）：超过仍无首个真实 token → abort 并静默重试 |
-| `retryOnEmpty` | `true` | 流正常结束但零内容（空响应）也静默重试 |
-| `maxAttempts` | `20` | 单请求最大尝试次数（含首次） |
-| `maxTotalWaitMs` | `0` | 单请求累计等待上限（ms），`0` = 不限 |
-| `backoff` | 2000/60000/2/0.1 | 基础延迟 / 单次上限 / 指数倍数 / 抖动 |
-| `models` | `{}` | 按模型 glob 覆盖首字阈值，`*` 通配、大小写不敏感 |
-| `showStatus` | `true` | 状态栏显示 `静默重试 #n（首字 20s 无响应，等 Xs）` |
+| `firstTokenTimeoutMs` | `20000` | 首字阈值（ms）：超过仍无首个真实 token → abort 并重试 |
+| `retryOnEmpty` | `true` | 流正常结束但零内容（空响应）也重试 |
+| `models` | `{}` | 按模型 glob 覆盖首字阈值，如 `{ "anthropic/claude*": { "firstTokenTimeoutMs": 45000 } }` |
 
-## pi-breaker 配置（熔断 / 自动切模型）
-
-`~/.pi/pi-breaker.json`：
-
-```json
-{
-  "enabled": true,
-  "failureThreshold": 5,
-  "resetTimeoutMs": 120000,
-  "cooldownMs": 60000,
-  "fallbackModels": [
-    { "provider": "anthropic", "model": "claude-haiku-4-5" }
-  ],
-  "models": {},
-  "showStatus": true
-}
-```
+### breaker（熔断 + 自动切模型）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `failureThreshold` | `1` | 连续失败多少次后熔断（`open`，暂停使用该模型）。默认 **1**：重试耗尽仍失败 = 模型已挂，一次即熔断 |
-| —（护栏） | 仅可重试类 | **只有可重试类失败**（network/5xx/429/timeout/配额）才计入熔断；400/鉴权/未知（我们自己的 bug/配置）**不熔断好模型** |
-| `resetTimeoutMs` | `120000` | **熔断多少秒恢复**：`open` 后等这么久才进 `half-open` 放一个探测请求；探测成功→`closed`（恢复），失败→再 `open` |
-| `cooldownMs` | `60000` | 单次失败后的冷却（ms）；临时错(network/timeout/临时鉴权)自动用 **5s** |
-| `fallbackModels` | `[]` | 熔断/失败后依次尝试的备用模型链，`{ provider, model }`；切模型用 `ctx.modelRegistry` |
-| `models` | `{}` | 按模型 glob 覆盖**冷却**（如 `{ "anthropic/claude*": { "cooldownMs": 180000 } }`）；`failureThreshold`/`resetTimeoutMs` 因熔断器全局共享，**不按模型覆盖** |
-| `showStatus` | `true` | 状态栏显示进度 |
+| `failureThreshold` | `1` | 连续失败多少次后熔断（`open`）。默认 **1**：重试耗尽仍失败 = 模型已挂，一次即熔断 |
+| `resetTimeoutMs` | `120000` | **熔断多少秒恢复**：`open` 后等这么久才进 `half-open` 放一个探测请求；探测成功→`closed`，失败→再 `open` |
+| `cooldownMs` | `60000` | 单次失败后的冷却（ms）；临时错(network/timeout/鉴权)自动用 **5s** |
+| `models` | `{}` | 按模型 glob 覆盖**冷却**（如 `{ "anthropic/claude*": { "cooldownMs": 180000 } }`） |
 
 > **熔断状态机**：`closed` →(连续失败≥阈值)→ `open`(拒绝) →(`resetTimeoutMs` 后)→ `half-open`(放 1 个探测) →(成功)→ `closed`，→(失败)→ 再 `open`。`half-open` 只放一个探测（防恢复风暴）。
 
-## 工作原理（三者一致）
+### fallback（备用模型链）
 
-1. `session_start` / `model_select` 时拿到当前 provider，包装其 `stream` / `streamSimple`
-2. 每个请求包进重试循环，产出新的 `AssistantMessageEventStream`（官方工厂）
-3. 重试/切换只发生在**尚未产出任何内容**时（内容无法安全重放）：
-   - pi-retry：错误事件且未产出内容 → 按策略重试
-   - pi-ttft：首字超时 / 空响应 → 按退避重试
-   - pi-breaker：失败 → 计一次熔断失败 + 冷却 → 切下一个（`fallbackModels` 链）；熔断则跳过
-4. `pi.registerProvider()` 注册回 registry，对 pi 透明
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `models` | `[]` | 熔断/失败后依次尝试的备用模型，`{ provider, model }` |
+| `maxAttempts` | `8` | 每个备用模型的单请求最大尝试次数（备用同样走完整重试） |
 
-### 唯一硬例外
+## 工作原理（无感 + 无缝）
 
-- **用户取消（abort）** —— 尊重用户意志，永不重试、不计熔断失败。
+```
+pi → pi-resilience（单层包装 provider stream）
+       ├─ ① 熔断检查（主模型电路 open/冷却 → 跳③）
+       ├─ ② 重试+首字看门狗（同一循环，同模型，含退避）
+       ├─ ③ ② 耗尽仍失败 → 熔断主模型 → 切备用链
+       └─ 备用链 [F1,F2,...]：每个也走②的完整重试 + 透传同一 context
+```
 
-### 三者的分工（互补不重叠）
+1. `session_start` / `model_select` 时拿到当前 provider，包装其 `stream` / `streamSimple`；
+2. 每个请求包进**显式级联**（顺序写死在代码里，无加载顺序坑）；
+3. 只重试/切换「**尚未产出任何内容**」的失败（内容无法安全重放）；`committed`（已产出）直接上交；
+4. **唯一硬例外**：用户 `abort` —— 尊重意志，永不重试、不计熔断失败。
 
-| 扩展 | 范围 | 触发 | 干什么 |
-|---|---|---|---|
-| pi-retry | 单请求内 | 错误 | 同一模型静默重试（配额/429/5xx/网络/overflow） |
-| pi-ttft | 单请求内 | 首字太久/空响应 | 同一模型静默重试 |
-| pi-breaker | **跨请求** | 连续失败 | **熔断该模型 + 自动切备用模型** |
+### 无感
+包装在请求层，内部重试/切换，从不 `pi.sendMessage`、不注入消息、不依赖 pi 内置 retry。pi 看到的是**一条正常流**。
 
-### 三者耦合为一个系统（一个项目，共享 hub）
-
-三者通过 `lib/resilience.ts` 的 **hub 单例**相互调通（一个项目 = 一个系统）：
-
-- **共享状态**：同一个熔断器（`hub.breaker`）、同一份配置（`hub.config`）、同一份会话统计（`hub.stats`）。
-- **重试层 → 熔断层显式上报**：`pi-retry` / `pi-ttft` 耗尽重试时调用 `hub.noteExhausted(模型, 错误, 次数)`，**显式声明「此模型已被证明不行」**；`pi-breaker` 失败时 `hub.takeExhausted(键)` 消费该信号（15s 内有效），明确区分「重试耗尽（判死刑）」vs「单次失败」。
-- **加载顺序仍是级联关键**：`pi-retry` → `pi-ttft` → `pi-breaker`（最后 = 最外层）。重试层在内部把同模型试到耗尽，熔断层在最外层看到最终结果并决策。
-
-> **因为耦合，`failureThreshold=1` 完全成立**：重试层已把模型试到耗尽（10s~15min）才上报失败，熔断层收到的是「判死刑」信号，一次即熔断。不再存在「单次瞬时 5xx 误熔断」问题——那是重试层的活。
+### 无缝
+切到备用模型时，把**同一个 `TranscriptContext`（对话消息数组）**传给备用 `provider.stream()` —— 备用模型拿到完整对话接着写。「内容前」事件（`start` 等）先缓冲，失败候选丢弃、成功候选才放行，避免重复 `start` / 失败候选污染输出流。
 
 ## 与 pi-quiver 的 provider-stall-watchdog 对比
 
-| 维度 | provider-stall-watchdog | **pi-retry-kit（本包）** |
+| 维度 | provider-stall-watchdog | **pi-resilience（本包）** |
 |---|---|---|
 | 静默 | 会 `pi.sendMessage` 注入合成消息，借 pi 内置 retry | **完全静默**，无消息、无注入、不依赖 pi 内置 retry |
-| 重试归属 | 借 pi 内置 retry（预算默认 3） | **自己管重试循环**（`maxAttempts` 默认 20） |
+| 重试归属 | 借 pi 内置 retry（预算默认 3） | **自己管重试循环**（默认 20） |
 | 退避 | 固定 `base*2^(n-1)` | 可配 `base/max/multiplier/jitter` |
-| 按模型覆盖 | 有（`models` glob） | 有（pi-ttft 的 `models` glob） |
-| 错误维度 | 不处理 | pi-retry 处理（mode/match/retry-after/overflow） |
-| 空响应 | 不专门处理 | pi-ttft `retryOnEmpty` |
-| 熔断+切模型 | 无 | **pi-breaker**（`closed/open/half-open` + `fallbackModels`） |
+| 按模型覆盖 | 有（`models` glob） | 有（ttft / breaker 的 `models` glob） |
+| 错误维度 | 不处理 | retry 处理（mode/match/retry-after/overflow） |
+| 空响应 | 不专门处理 | ttft `retryOnEmpty` |
+| 熔断+切模型 | 无 | **有**（`closed/open/half-open` + `fallbackModels`，且备用带重试+上下文透传） |
+
+## 命令
+
+- `/pi-resilience` —— 显示配置、各电路状态（closed/open/half-open + 恢复时间）、本会话统计。
+
+## 开发（本仓库）
+
+```bash
+bun build extensions/pi-resilience.ts --external '@earendil-works/*' --external 'node:*' --target=bun
+# tsc 严格检查（模块解析 Bundler，映射到全局安装的 pi 类型）
+```
 
 ## 发布（Release）
 
-本包走 **git tag 发行**（与 `pi install git:...` 配套），也可走 npm。发布步骤：
-
-```bash
-# 1) 推代码到 GitHub 仓库 chentianxiong123/pi-retry-kit
-pi-retry-kit> git push -u origin main
-
-# 2) 打版本 tag（版本号与 package.json 一致）
-pi-retry-kit> git tag v0.4.0
-pi-retry-kit> git push origin v0.4.0
-
-# 3) 用户安装
-pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
-```
-
-npm 备选（包名 `pi-retry-kit` 当前未被占用）：
-
-```bash
-pi-retry-kit> npm publish   # 需要 npm login，且 peerDeps 只列 @earendil-works/*（host 提供）
-pi install npm:pi-retry-kit
-```
-
-> git tag 是**不可变**引用：`pi install git:...@v0.4.0` 会固定在该 tag。改代码后必须打**新 tag**（如 `v0.4.1`），不要原地改 tag。
-
-## 开发
-
-```bash
-# 类型/语法检查（pi 运行时通过 loader aliases 解析捆绑的 pi-ai，无需本地安装）
-bun build extensions/pi-retry.ts --external '@earendil-works/*' --external 'node:*' --target=bun
-bun build extensions/pi-ttft.ts  --external '@earendil-works/*' --external 'node:*' --target=bun
-```
-
-## License
-
-MIT
+- 主路径：`git tag v0.5.0 && git push --tags`（仓库 `chentianxiong123/pi-retry-kit`）；
+- 备选：`npm publish`（包名 `pi-retry-kit` 未被占用，需 `npm login`）。

@@ -1,19 +1,29 @@
 {
   "name": "pi-retry-kit",
   "private": false,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
-  "description": "Resilience toolkit for pi (single package, multiple built-in extensions): silent unconditional error retry (pi-retry) + silent first-token / TTFT watchdog retry (pi-ttft). Wraps the provider stream at the request layer, retries without touching the model context or sending any messages.",
-  "keywords": ["pi-package", "retry", "ttft", "time-to-first-token", "watchdog", "quota", "rate-limit", "stall", "first-token", "toolkit", "extension"],
+  "description": "Resilience plugin for pi: silent unconditional retry + first-token watchdog + circuit breaker / auto model failover, in one request-layer wrapper. No messages injected, no reliance on pi built-in retry.",
+  "keywords": [
+    "pi-package",
+    "retry",
+    "ttft",
+    "time-to-first-token",
+    "watchdog",
+    "quota",
+    "rate-limit",
+    "stall",
+    "first-token",
+    "toolkit",
+    "extension"
+  ],
   "scripts": {
     "build": "echo 'nothing to build (jiti loads TS directly)'",
     "check": "echo 'nothing to check'"
   },
   "pi": {
     "extensions": [
-      "./extensions/pi-retry.ts",
-      "./extensions/pi-ttft.ts",
-      "./extensions/pi-breaker.ts"
+      "./extensions/pi-resilience.ts"
     ]
   },
   "peerDependencies": {
