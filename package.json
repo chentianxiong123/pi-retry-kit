@@ -23,7 +23,8 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/pi-resilience.ts"
+      "./extensions/pi-resilience.ts",
+      "./extensions/pi-notify.ts"
     ]
   },
   "peerDependencies": {
