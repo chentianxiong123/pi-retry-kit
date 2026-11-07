@@ -235,51 +235,78 @@ export default function (pi: ExtensionAPI) {
 	// ---- 常驻 footer 状态条：实时秒表 + 物理模型 + 熔断 + 重试（setStatus，不注入消息，不违反无感）----
 	let currentPhysical: string | undefined;
 	let retryInfo: string | undefined;
-	// 回合实时秒表：turnStart>0 表示计时中（每秒刷新），回合结束保留最终耗时
+	// 回合实时秒表：turnStart>0 表示计时中（每 500ms 刷新），回合结束保留最终耗时
 	let turnStart = 0;
 	let turnElapsed = 0;
 	let turnTimer: ReturnType<typeof setInterval> | undefined;
 	let turnAttempts = 0;
 	let lastFirstTokenMs = 0;
+	// footerCtx 由事件回调在每次更新时刷新为「当前会话的有效 ctx」，避免闭包捕获到 stale ctx。
+	// stale ctx 在 session 替换 / reload 后仍被调用会导致 pi 抛 "extension ctx is stale" 并注入无 usage 的 assistant error 消息，
+	// 进而触发 pi 的 getSessionStats 崩溃（Cannot read properties of undefined (reading 'input')）。
+	let footerCtx: any;
 	function startTurnTimer(ctx: any) {
 		stopTurnTimer();
 		turnStart = Date.now();
 		turnElapsed = 0;
 		turnAttempts = 0;
 		lastFirstTokenMs = 0;
-		updateFooter(ctx);
-		turnTimer = setInterval(() => updateFooter(ctx), 500);
+		footerCtx = ctx;
+		updateFooter();
+		turnTimer = setInterval(updateFooter, 500);
 	}
 	function stopTurnTimer() {
 		if (turnTimer) clearInterval(turnTimer);
 		turnTimer = undefined;
 		if (turnStart > 0) { turnElapsed = Date.now() - turnStart; turnStart = 0; }
 	}
-	function updateFooter(ctx: any) {
-		if (!config.showStatus || !ctx?.ui?.setStatus) return;
-		const parts: string[] = [];
-		// 实时秒表
-		if (turnStart > 0 || turnElapsed > 0) {
-			const ms = turnStart > 0 ? Date.now() - turnStart : turnElapsed;
-			let s = `回合 ${(ms / 1000).toFixed(1)}s`;
-			if (turnStart === 0 && lastFirstTokenMs > 0) s += `(首字 ${(lastFirstTokenMs / 1000).toFixed(1)}s)`;
-			if (turnStart === 0 && turnAttempts > 1) s += `(重试${turnAttempts - 1})`;
-			parts.push(s);
-		}
-		if (currentPhysical) parts.push(`物理=${currentPhysical}`);
-		if (retryInfo) parts.push(retryInfo);
-		const trips: string[] = [];
-		for (const [k, s] of breaker.circuits) {
-			if (s.state === "closed") continue;
-			if (s.state === "open") {
-				const secs = Math.max(0, Math.round((s.nextRetryTime - Date.now()) / 1000));
-				trips.push(`${k} 开(还${secs}s)`);
-			} else {
-				trips.push(`${k} ${s.state}`);
+	/** 彻底释放秒表定时器 + 引用（session 切换 / shutdown 时调用，防止定时器在旧 ctx 上继续跑） */
+	function disposeTurnTimer() {
+		if (turnTimer) clearInterval(turnTimer);
+		turnTimer = undefined;
+		turnStart = 0;
+		turnElapsed = 0;
+		turnAttempts = 0;
+		lastFirstTokenMs = 0;
+		footerCtx = undefined;
+	}
+	function updateFooter(ctx?: any) {
+		// 显式 ctx 优先（事件回调传当前 ctx）；否则用最近一次的有效 ctx。
+		// 两者都无效或已 stale → 直接跳过，绝不调用 stale ctx 的 ui（这是崩溃根源）。
+		const target = ctx ?? footerCtx;
+		if (!config.showStatus || !target?.ui?.setStatus) return;
+		// 防御：ctx 可能已因 session 替换 / reload 失效。isIdle()/getContextUsage 在 stale 上
+		// 可能抛错，这里兜住，避免定时器在 session 结束后仍触碰旧 ctx。
+		try {
+			// 只在目标有效时刷新 footerCtx（定时器回调不带 ctx，继续用最近一次的有效引用）
+			if (ctx) footerCtx = ctx;
+			const parts: string[] = [];
+			// 实时秒表
+			if (turnStart > 0 || turnElapsed > 0) {
+				const ms = turnStart > 0 ? Date.now() - turnStart : turnElapsed;
+				let s = `回合 ${(ms / 1000).toFixed(1)}s`;
+				if (turnStart === 0 && lastFirstTokenMs > 0) s += `(首字 ${(lastFirstTokenMs / 1000).toFixed(1)}s)`;
+				if (turnStart === 0 && turnAttempts > 1) s += `(重试${turnAttempts - 1})`;
+				parts.push(s);
 			}
+			if (currentPhysical) parts.push(`物理=${currentPhysical}`);
+			if (retryInfo) parts.push(retryInfo);
+			const trips: string[] = [];
+			for (const [k, s] of breaker.circuits) {
+				if (s.state === "closed") continue;
+				if (s.state === "open") {
+					const secs = Math.max(0, Math.round((s.nextRetryTime - Date.now()) / 1000));
+					trips.push(`${k} 开(还${secs}s)`);
+				} else {
+					trips.push(`${k} ${s.state}`);
+				}
+			}
+			if (trips.length) parts.push(`熔断: ${trips.join("；")}`);
+			target.ui.setStatus("pi-resilience", parts.length ? parts.join(" | ") : undefined);
+		} catch {
+			// ctx stale / 已销毁：放弃本次刷新（不注入错误消息，避免 pi 崩溃）。
+			if (ctx) footerCtx = undefined;
 		}
-		if (trips.length) parts.push(`熔断: ${trips.join("；")}`);
-		ctx.ui.setStatus("pi-resilience", parts.length ? parts.join(" | ") : undefined);
 	}
 
 	// ---- 熔断 / 冷却 ----
@@ -709,6 +736,15 @@ export default function (pi: ExtensionAPI) {
 		currentPhysical = event.model ? `${event.model.provider}/${event.model.id}` : undefined;
 		updateFooter(ctx);
 	});
+
+	// ---- 秒表生命周期：session 切换 / 关闭时彻底释放定时器，防止旧 ctx 在 session 结束后仍被定时器触碰 ----
+	// 这是 stale-ctx 崩溃（Cannot read properties of undefined (reading 'input')）的根治：
+	// 之前 setInterval 闭包捕获旧 ctx，session 替换后仍调用 setStatus → pi 注入无 usage 的 assistant error 消息
+	// → pi 的 getSessionStats 遍历到该消息时对 usage 无守卫 → 崩溃。
+	pi.on("session_before_switch", () => { disposeTurnTimer(); });
+	pi.on("session_shutdown", () => { disposeTurnTimer(); });
+	pi.on("session_before_fork", () => { disposeTurnTimer(); });
+	pi.on("session_before_compact", () => { disposeTurnTimer(); });
 
 	// ---- 虚拟模型 route：无缝换模型（pi 统计记实际 dispatch 的物理模型）----
 	// 用户选 pi-resilience/auto，pi 每次请求前调 route() 按电路选物理模型：
