@@ -101,7 +101,10 @@ export function computeDelay(retry: ResilienceConfig["retry"], attempt: number, 
 	if (retry.respectRetryAfter && retryAfterMs > 0) {
 		delay = retryAfterMs;
 	} else {
-		delay = retry.backoff.baseDelayMs * retry.backoff.multiplier ** Math.min(attempt - 1, 10);
+		// 健壮性：attempt/multiplier 下限 1（避免 attempt=0 负指数减半、multiplier=0 退避恒 0）
+		const safeAttempt = Math.max(1, attempt);
+		const safeMultiplier = Math.max(1, retry.backoff.multiplier);
+		delay = retry.backoff.baseDelayMs * safeMultiplier ** Math.min(safeAttempt - 1, 10);
 	}
 	delay = Math.min(delay, retry.backoff.maxDelayMs);
 	if (retry.backoff.jitter > 0) {
