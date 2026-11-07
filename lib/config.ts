@@ -92,7 +92,7 @@ export const DEFAULT_CONFIG: ResilienceConfig = {
 	},
 };
 
-const CONFIG_PATH = join(homedir(), ".pi", "pi-resilience.json");
+const CONFIG_PATH = process.env.PI_RESILIENCE_CONFIG ?? join(homedir(), ".pi", "pi-resilience.json");
 
 function deep<T>(base: T, patch: unknown): T {
 	if (patch === undefined || patch === null) return base;
