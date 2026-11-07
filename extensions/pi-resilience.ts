@@ -449,9 +449,14 @@ export default function (pi: ExtensionAPI) {
 		key: string;
 		label: string;
 		model: ModelInfo;
+		modelObj?: Model<Api>;
 		isPrimary: boolean;
 		produce: () => AssistantMessageEventStream;
 	};
+
+	// 显式切模型状态：备用成功后 pendingSwitchTo，turn_end 时 pi.setModel(备用)（可见、非无缝）
+	let pendingSwitchTo: Model<Api> | undefined;
+	let lastActualModel = "";
 
 	function resilienceStream(
 		produce: () => AssistantMessageEventStream,
@@ -489,6 +494,7 @@ export default function (pi: ExtensionAPI) {
 				key: keyOf({ provider: fb.provider, id: fb.model }),
 				label: `${fb.provider}/${fb.model}`,
 				model: { provider: fb.provider, id: fb.model },
+				modelObj: fbModel,
 				isPrimary: false,
 				produce: fbProduce,
 			});
@@ -510,7 +516,12 @@ export default function (pi: ExtensionAPI) {
 
 					switch (res.status) {
 						case "success":
-							if (!cand.isPrimary) stats.switched++;
+							lastActualModel = cand.label;
+							if (!cand.isPrimary) {
+								stats.switched++;
+								pendingSwitchTo = cand.modelObj;
+								if (config.showStatus) ctx.ui?.setStatus?.("pi-resilience", `已切备用模型 ${cand.label}`);
+							}
 							recordResult(cand.key, true);
 							out.end();
 							return;
@@ -590,12 +601,27 @@ export default function (pi: ExtensionAPI) {
 		wrappedProviders.add(providerId);
 	}
 
-	// ---- 会话开始 / 模型切换时包装当前 provider ----
+	// ---- 会话开始 / 模型切换时包装当前 provider（含全部备用 provider，防切过去后失去保护）----
 	pi.on("session_start", async (_event, ctx) => {
 		wrapProvider(ctx.model?.provider, ctx);
+		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
 	});
 	pi.on("model_select", async (event, ctx) => {
 		wrapProvider(event.model?.provider, ctx);
+		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
+	});
+
+	// ---- turn_end：若本 turn 切到了备用模型，让 pi 真正切过去（可见 + 后续统计记备用）----
+	pi.on("turn_end", async (_event, ctx) => {
+		if (!pendingSwitchTo) return;
+		const target = pendingSwitchTo;
+		pendingSwitchTo = undefined;
+		try {
+			const ok = await pi.setModel(target);
+			debug(`setModel -> ${target.provider}/${target.id} = ${ok}`);
+		} catch (err) {
+			debug(`setModel failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	});
 
 	// ---- 状态/统计命令 ----
@@ -611,6 +637,7 @@ export default function (pi: ExtensionAPI) {
 			lines.push(
 				`备用=${config.fallback.models.map((f) => `${f.provider}/${f.model}`).join(",") || "无"}（×${config.fallback.maxAttempts}）`,
 			);
+			if (lastActualModel) lines.push(`本次请求实际用：${lastActualModel}${pendingSwitchTo ? "（待切）" : ""}`);
 			for (const [key, s] of breaker.circuits) {
 				const next = s.state === "open" ? ` → 恢复于 ${new Date(s.nextRetryTime).toLocaleTimeString()}` : "";
 				lines.push(`  ${key}: ${s.state} (失败${s.failureCount})${next}`);
