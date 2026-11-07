@@ -48,6 +48,10 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
     "resetTimeoutMs": 120000,
     "cooldownMs": 60000
   },
+  "primary": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5"
+  },
   "fallback": {
     "models": [
       { "provider": "anthropic", "model": "claude-haiku-4-5" }
@@ -56,6 +60,8 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
   }
 }
 ```
+
+> **虚拟模型**：插件注册一个可选择的模型 `pi-resilience/auto`（出现在 `/model`）。选中它后，`route()` 每次请求前按电路状态选物理模型（`primary` 健康→用它；熔断→第一个健康 `fallback`）。**pi 的统计记录实际 dispatch 的物理模型**，切模型**无缝**。
 
 ### retry（错误静默重试）
 
@@ -92,29 +98,31 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `models` | `[]` | 熔断/失败后依次尝试的备用模型，`{ provider, model }` |
-| `maxAttempts` | `8` | 每个备用模型的单请求最大尝试次数（备用同样走完整重试） |
+| `primary` | — | **主模型** `{ provider, model }`：虚拟模型 route 的首选；电路闭合时用它 |
+| `fallback.models` | `[]` | 熔断后依次尝试的备用模型链 `{ provider, model }` |
+| `fallback.maxAttempts` | `8` | 每个备用模型的单请求最大尝试次数 |
 
 ## 工作原理（无感 + 无缝）
 
 ```
-pi → pi-resilience（单层包装 provider stream）
-       ├─ ① 熔断检查（主模型电路 open/冷却 → 跳③）
-       ├─ ② 重试+首字看门狗（同一循环，同模型，含退避）
-       ├─ ③ ② 耗尽仍失败 → 熔断主模型 → 切备用链
-       └─ 备用链 [F1,F2,...]：每个也走②的完整重试 + 透传同一 context
+用户选 pi-resilience/auto（虚拟模型）
+  pi → route() 每请求按电路选物理模型：主健康→主；主熔断→第一个健康备用
+       （continuation 且 previous 健康 → 保留 previous，prompt cache 有效）
+       ↓ pi dispatch 到该物理模型（统计记这个物理模型）
+  provider.stream（被我们包装）→ 静默重试 + 首字看门狗（自管）
+       ↓ 重试耗尽 → 熔断该模型 → 下次 route() 自动切健康备用（无缝）
 ```
 
-1. `session_start` / `model_select` 时拿到当前 provider，包装其 `stream` / `streamSimple`；
-2. 每个请求包进**显式级联**（顺序写死在代码里，无加载顺序坑）；
+1. **虚拟模型 `pi-resilience/auto`**：选中后，`route()` 每次请求前按电路状态选物理模型，**pi 的统计记录实际 dispatch 的物理模型**（`provider`/`api`/`model`）——切模型**无缝 + pi 统计记对**；
+2. `session_start` / `model_select` 时包装当前 provider（含全部候选），做**静默重试 + 首字看门狗**；
 3. 只重试/切换「**尚未产出任何内容**」的失败（内容无法安全重放）；`committed`（已产出）直接上交；
 4. **唯一硬例外**：用户 `abort` —— 尊重意志，永不重试、不计熔断失败。
 
 ### 无感
-包装在请求层，内部重试/切换，从不 `pi.sendMessage`、不注入消息、不依赖 pi 内置 retry。pi 看到的是**一条正常流**。
+包装在请求层，内部重试，从不 `pi.sendMessage`、不注入消息、不依赖 pi 内置 retry。pi 看到的是**一条正常流**。
 
-### 无缝
-切到备用模型时，把**同一个 `TranscriptContext`（对话消息数组）**传给备用 `provider.stream()` —— 备用模型拿到完整对话接着写。「内容前」事件（`start` 等）先缓冲，失败候选丢弃、成功候选才放行，避免重复 `start` / 失败候选污染输出流。
+### 无缝（切模型）
+`route()` 由 pi 在 dispatch 前调用，pi 把请求发到 route 选的物理模型——**选择（虚拟）与 dispatch（物理）分离**：用户无感，且 pi 的 assistant message / 统计记录物理模型。切到备用时透传同一个 `TranscriptContext`（完整对话）＋「内容前」事件缓冲（失败候选丢弃），无重复 `start`、无污染。
 
 ## 与 pi-quiver 的 provider-stall-watchdog 对比
 

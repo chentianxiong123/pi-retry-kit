@@ -83,6 +83,8 @@ interface ResilienceConfig {
 		models: { provider: string; model: string }[];
 		maxAttempts: number;
 	};
+	/** 主模型（虚拟模型 route 的首选；可空则退化为只用 fallback） */
+	primary?: { provider: string; model: string };
 }
 
 const DEFAULT_CONFIG: ResilienceConfig = {
@@ -449,14 +451,33 @@ export default function (pi: ExtensionAPI) {
 		key: string;
 		label: string;
 		model: ModelInfo;
-		modelObj?: Model<Api>;
 		isPrimary: boolean;
 		produce: () => AssistantMessageEventStream;
 	};
 
-	// 显式切模型状态：备用成功后 pendingSwitchTo，turn_end 时 pi.setModel(备用)（可见、非无缝）
-	let pendingSwitchTo: Model<Api> | undefined;
-	let lastActualModel = "";
+	// 候选列表 = [primary, ...fallbacks]（route 与 wrapper 共享同一顺序）
+	function buildCandidates(ctx: any): { model: Model<Api>; key: string; label: string }[] {
+		const specs: { provider: string; model: string }[] = [];
+		if (config.primary) specs.push(config.primary);
+		for (const fb of config.fallback.models) specs.push(fb);
+		const list: { model: Model<Api>; key: string; label: string }[] = [];
+		for (const s of specs) {
+			const m = ctx.modelRegistry?.find(s.provider, s.model) as Model<Api> | undefined;
+			if (!m) { debug(`candidate not found: ${s.provider}/${s.model}`); continue; }
+			list.push({ model: m, key: keyOf({ provider: s.provider, id: s.model }), label: `${s.provider}/${s.model}` });
+		}
+		return list;
+	}
+
+	// 只读健康检查（不认领探测槽，route 用）
+	function isHealthy(key: string): boolean {
+		if (inCooldown(key)) return false;
+		const s = breaker.circuits.get(key);
+		if (!s) return true;
+		if (s.state === "closed") return true;
+		if (s.state === "open") return Date.now() >= s.nextRetryTime;
+		return !s.halfOpenInFlight;
+	}
 
 	function resilienceStream(
 		produce: () => AssistantMessageEventStream,
@@ -469,34 +490,31 @@ export default function (pi: ExtensionAPI) {
 		const userSignal = options?.signal;
 		const chain: Candidate[] = [];
 
-		// 主模型
+		// 被派发模型 = 主（produce 由调用方捕获原始 stream，防递归）
+		const dispatchedKey = model ? keyOf(model) : "unknown";
 		chain.push({
-			key: model ? keyOf(model) : "unknown",
+			key: dispatchedKey,
 			label: model ? `${model.provider}/${model.id}` : "unknown",
 			model,
 			isPrimary: true,
 			produce,
 		});
 
-		// 备用链（一律走原始流，防递归；同一个 context 透传 = 无缝）
-		for (const fb of config.fallback.models) {
-			const fbModel = ctx.modelRegistry?.find(fb.provider, fb.model) as Model<Api> | undefined;
-			if (!fbModel) { debug(`fallback model not found: ${fb.provider}/${fb.model}`); continue; }
-			const fbProvider = ctx.modelRegistry?.getProvider(fb.provider);
-			if (!fbProvider) { debug(`fallback provider not found: ${fb.provider}`); continue; }
-			const orig = origStreams.get(fb.provider);
-			const fbProduce = () => {
-				if (orig?.stream) return orig.stream.call(fbProvider, fbModel, context, options);
-				if (fbProvider.stream) return fbProvider.stream(fbModel, context, options);
-				throw new Error(`no stream for fallback ${fb.provider}/${fb.model}`);
-			};
+		// 其余候选（primary + fallbacks，去掉被派发模型；走原始流；透传同一 context = 无缝）
+		for (const c of buildCandidates(ctx)) {
+			if (c.key === dispatchedKey) continue;
+			const fbProvider = ctx.modelRegistry?.getProvider(c.model.provider);
+			if (!fbProvider) continue;
+			const orig = origStreams.get(c.model.provider);
 			chain.push({
-				key: keyOf({ provider: fb.provider, id: fb.model }),
-				label: `${fb.provider}/${fb.model}`,
-				model: { provider: fb.provider, id: fb.model },
-				modelObj: fbModel,
+				key: c.key,
+				label: c.label,
+				model: { provider: c.model.provider, id: c.model.id },
 				isPrimary: false,
-				produce: fbProduce,
+				produce: () =>
+					orig?.stream
+						? orig.stream.call(fbProvider, c.model, context, options)
+						: fbProvider.stream(c.model, context, options),
 			});
 		}
 
@@ -516,10 +534,8 @@ export default function (pi: ExtensionAPI) {
 
 					switch (res.status) {
 						case "success":
-							lastActualModel = cand.label;
 							if (!cand.isPrimary) {
 								stats.switched++;
-								pendingSwitchTo = cand.modelObj;
 								if (config.showStatus) ctx.ui?.setStatus?.("pi-resilience", `已切备用模型 ${cand.label}`);
 							}
 							recordResult(cand.key, true);
@@ -605,23 +621,54 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		wrapProvider(ctx.model?.provider, ctx);
 		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
+		if (config.primary) wrapProvider(config.primary.provider, ctx);
 	});
 	pi.on("model_select", async (event, ctx) => {
 		wrapProvider(event.model?.provider, ctx);
 		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
+		if (config.primary) wrapProvider(config.primary.provider, ctx);
 	});
 
-	// ---- turn_end：若本 turn 切到了备用模型，让 pi 真正切过去（可见 + 后续统计记备用）----
-	pi.on("turn_end", async (_event, ctx) => {
-		if (!pendingSwitchTo) return;
-		const target = pendingSwitchTo;
-		pendingSwitchTo = undefined;
-		try {
-			const ok = await pi.setModel(target);
-			debug(`setModel -> ${target.provider}/${target.id} = ${ok}`);
-		} catch (err) {
-			debug(`setModel failed: ${err instanceof Error ? err.message : String(err)}`);
-		}
+	// ---- 虚拟模型 route：无缝换模型（pi 统计记实际 dispatch 的物理模型）----
+	// 用户选 pi-resilience/auto，pi 每次请求前调 route() 按电路选物理模型：
+	//   主健康 → 主；主熔断 → 第一个健康备用。retry 时跳过失败模型。
+	//   continuation 且 previous 健康 → 保留 previous（prompt cache）。
+	pi.registerVirtualModel({
+		provider: "pi-resilience",
+		id: "auto",
+		name: "Auto (resilience)",
+		thinkingLevels: ["off", "low", "medium", "high"],
+		route(request, ctx) {
+			const candidates = buildCandidates(ctx);
+			if (candidates.length === 0) {
+				// 无候选：退到 previous（保缓存）；若无 previous 则报错
+				if (request.previous?.model) {
+					return { model: request.previous.model, thinkingLevel: request.previous.thinkingLevel ?? request.thinkingLevel };
+				}
+				throw new Error("pi-resilience: 无有效候选模型（检查 primary / fallback.models）");
+			}
+			const failedKey =
+				request.reason === "retry" && request.failed
+					? keyOf({ provider: request.failed.model.provider, id: request.failed.model.id })
+					: undefined;
+			// continuation：若 previous 健康，保留它（prompt cache 有效，无缝）
+			if (
+				request.reason !== "user" &&
+				request.previous &&
+				keyOf({ provider: request.previous.model.provider, id: request.previous.model.id }) !== failedKey &&
+				isHealthy(keyOf({ provider: request.previous.model.provider, id: request.previous.model.id }))
+			) {
+				return { model: request.previous.model, thinkingLevel: request.previous.thinkingLevel ?? request.thinkingLevel };
+			}
+			// 选第一个健康候选（跳过失败模型）
+			for (const c of candidates) {
+				if (c.key === failedKey) continue;
+				if (isHealthy(c.key)) return { model: c.model, thinkingLevel: request.thinkingLevel };
+			}
+			// 全部不健康：取第一个（非失败）候选去试（half-open 探测）
+			const first = candidates.find((c) => c.key !== failedKey) ?? candidates[0];
+			return { model: first.model, thinkingLevel: request.thinkingLevel };
+		},
 	});
 
 	// ---- 状态/统计命令 ----
@@ -637,7 +684,7 @@ export default function (pi: ExtensionAPI) {
 			lines.push(
 				`备用=${config.fallback.models.map((f) => `${f.provider}/${f.model}`).join(",") || "无"}（×${config.fallback.maxAttempts}）`,
 			);
-			if (lastActualModel) lines.push(`本次请求实际用：${lastActualModel}${pendingSwitchTo ? "（待切）" : ""}`);
+			if (config.primary) lines.push(`主=${config.primary.provider}/${config.primary.model}`);
 			for (const [key, s] of breaker.circuits) {
 				const next = s.state === "open" ? ` → 恢复于 ${new Date(s.nextRetryTime).toLocaleTimeString()}` : "";
 				lines.push(`  ${key}: ${s.state} (失败${s.failureCount})${next}`);
