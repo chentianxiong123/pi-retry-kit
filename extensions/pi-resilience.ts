@@ -232,12 +232,40 @@ export default function (pi: ExtensionAPI) {
 	const cooldowns = new Map<string, number>();
 	const stats = { attempts: 0, retried: 0, recovered: 0, failedOver: 0, switched: 0, gaveUp: 0 };
 
-	// ---- 常驻 footer 状态条：物理模型 + 熔断 + 重试（setStatus，不注入消息，不违反无感）----
+	// ---- 常驻 footer 状态条：实时秒表 + 物理模型 + 熔断 + 重试（setStatus，不注入消息，不违反无感）----
 	let currentPhysical: string | undefined;
 	let retryInfo: string | undefined;
+	// 回合实时秒表：turnStart>0 表示计时中（每秒刷新），回合结束保留最终耗时
+	let turnStart = 0;
+	let turnElapsed = 0;
+	let turnTimer: ReturnType<typeof setInterval> | undefined;
+	let turnAttempts = 0;
+	let lastFirstTokenMs = 0;
+	function startTurnTimer(ctx: any) {
+		stopTurnTimer();
+		turnStart = Date.now();
+		turnElapsed = 0;
+		turnAttempts = 0;
+		lastFirstTokenMs = 0;
+		updateFooter(ctx);
+		turnTimer = setInterval(() => updateFooter(ctx), 500);
+	}
+	function stopTurnTimer() {
+		if (turnTimer) clearInterval(turnTimer);
+		turnTimer = undefined;
+		if (turnStart > 0) { turnElapsed = Date.now() - turnStart; turnStart = 0; }
+	}
 	function updateFooter(ctx: any) {
 		if (!config.showStatus || !ctx?.ui?.setStatus) return;
 		const parts: string[] = [];
+		// 实时秒表
+		if (turnStart > 0 || turnElapsed > 0) {
+			const ms = turnStart > 0 ? Date.now() - turnStart : turnElapsed;
+			let s = `回合 ${(ms / 1000).toFixed(1)}s`;
+			if (turnStart === 0 && lastFirstTokenMs > 0) s += `(首字 ${(lastFirstTokenMs / 1000).toFixed(1)}s)`;
+			if (turnStart === 0 && turnAttempts > 1) s += `(重试${turnAttempts - 1})`;
+			parts.push(s);
+		}
 		if (currentPhysical) parts.push(`物理=${currentPhysical}`);
 		if (retryInfo) parts.push(retryInfo);
 		const trips: string[] = [];
@@ -355,9 +383,11 @@ export default function (pi: ExtensionAPI) {
 			: options;
 
 		let attempt = 0;
+		let firstTokenThisTry = 0;
 		for (;;) {
 			attempt++;
 			stats.attempts++;
+			turnAttempts++;
 			let emitted = false;
 			let timeoutFired = false;
 			let errorText = "";
@@ -399,7 +429,7 @@ export default function (pi: ExtensionAPI) {
 						continue;
 					}
 					if (!flushed) { for (const p of prelude) out.push(p); flushed = true; }
-					if (!emitted && isContentEvent(ev)) emitted = true;
+					if (!emitted && isContentEvent(ev)) { emitted = true; firstTokenThisTry = Date.now() - t0; }
 					out.push(ev);
 				}
 			} catch (err) {
@@ -417,6 +447,7 @@ export default function (pi: ExtensionAPI) {
 			if (done && !haveError) {
 				if (emitted || !(useTtft && config.ttft.retryOnEmpty)) {
 					if (attempt > 1) stats.recovered++;
+					lastFirstTokenMs = firstTokenThisTry;
 					return { status: "success" };
 				}
 				emptyFired = true; // 空响应 → 按 ttft.retryOnEmpty 重试
@@ -513,10 +544,10 @@ export default function (pi: ExtensionAPI) {
 		const userSignal = options?.signal;
 		const chain: Candidate[] = [];
 
-		// 常驻 footer：当前被派发的物理模型
+		// 常驻 footer：启动实时秒表 + 记录被派发物理模型
 		currentPhysical = model ? `${model.provider}/${model.id}` : undefined;
 		retryInfo = undefined;
-		updateFooter(ctx);
+		startTurnTimer(ctx);
 
 		// 被派发模型 = 主（produce 由调用方捕获原始 stream，防递归）
 		const dispatchedKey = model ? keyOf(model) : "unknown";
@@ -566,6 +597,7 @@ export default function (pi: ExtensionAPI) {
 								stats.switched++;
 							}
 							recordResult(cand.key, true);
+							stopTurnTimer();
 							retryInfo = undefined;
 							updateFooter(ctx);
 							out.end();
@@ -573,6 +605,7 @@ export default function (pi: ExtensionAPI) {
 						case "aborted":
 							releaseProbe(cand.key);
 							stats.gaveUp++;
+							stopTurnTimer();
 							retryInfo = undefined;
 							updateFooter(ctx);
 							out.push(makeErrorEvent("已由用户取消"));
@@ -581,12 +614,14 @@ export default function (pi: ExtensionAPI) {
 							recordFailure(cand.model ?? { provider: "?", id: "?" }, res.error);
 							recordResult(cand.key, false);
 							stats.gaveUp++;
+							stopTurnTimer();
 							retryInfo = undefined;
 							updateFooter(ctx);
 							out.push(makeErrorEvent(res.error));
 							return;
 						case "nonRetryable":
 							stats.gaveUp++;
+							stopTurnTimer();
 							retryInfo = undefined;
 							updateFooter(ctx);
 							out.push(makeErrorEvent(res.error));
@@ -605,10 +640,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				// 全失败
 				stats.gaveUp++;
+				stopTurnTimer();
 				retryInfo = undefined;
 				updateFooter(ctx);
 				out.push(makeErrorEvent(errors.length > 0 ? errors.join("；") : "所有模型均不可用"));
 			} finally {
+				stopTurnTimer();
 				retryInfo = undefined;
 				updateFooter(ctx);
 			}
