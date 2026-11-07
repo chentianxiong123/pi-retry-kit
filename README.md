@@ -1,8 +1,9 @@
 # pi-retry-kit
 
-> **pi-resilience** —— 一个插件，三重静默防护：**静默重试 + 首字看门狗 + 熔断器/自动切模型**。
+> **pi 工具包**，当前含两个扩展：
 >
-> 包装 provider 的 `stream`/`streamSimple`，在**请求层**内部重试/切换。全程**无感**（不发消息、不注入、不依赖 pi 内置 retry）、**无缝**（切备用模型时透传同一个对话上下文）。pi 和模型全程无感知。
+> - **pi-resilience** —— 一个插件，三重静默防护：**静默重试 + 首字看门狗 + 熔断器/自动切模型**。包装 provider 的 `stream`/`streamSimple`，在**请求层**内部重试/切换。全程**无感**（不发消息、不注入、不依赖 pi 内置 retry）、**无缝**（切备用模型时透传同一个对话上下文）。pi 和模型全程无感知。
+> - **pi-notify** —— 回合结束后**桌面通知**（OSC 777 / Kitty OSC 99 / Windows toast），零依赖，只写 stdout escape 序列。
 
 ## 为什么需要它
 
@@ -19,6 +20,16 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
 ```
 
 > 或本地：`pi -e ./pi-retry-kit`。
+
+## pi-notify（回合后自动通知）
+
+监听 **`agent_settled`**（整轮完整跑完、等待输入时）→ 发终端桌面通知「Pi: Ready for input」。支持：
+
+- **OSC 777**：Ghostty / iTerm2 / WezTerm / rxvt-unicode；
+- **OSC 99**：Kitty；
+- **Windows toast**：Windows Terminal (WSL)。
+
+零依赖，只写 stdout escape 序列，不注入消息、不改变任何请求行为。与 pi-resilience 无关（这是「执行完提醒我」，不是容错）。
 
 ## 配置 `~/.pi/pi-resilience.json`
 
