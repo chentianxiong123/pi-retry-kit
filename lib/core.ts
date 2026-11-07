@@ -39,6 +39,18 @@ export function makeErrorEvent(message: string): AssistantMessageEvent {
 			stopReason: "error",
 			errorMessage: message,
 			content: [],
+			// 必须带 usage：pi 的 FooterComponent.getSessionStats 遍历消息时，
+			// addUsageToTotals 会读 msg.usage.input，缺 usage 则 undefined 崩溃
+			// （Cannot read properties of undefined (reading 'input')）。
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				reasoning: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
 		} as unknown as AssistantMessage,
 	};
 }
