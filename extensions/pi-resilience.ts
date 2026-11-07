@@ -232,6 +232,28 @@ export default function (pi: ExtensionAPI) {
 	const cooldowns = new Map<string, number>();
 	const stats = { attempts: 0, retried: 0, recovered: 0, failedOver: 0, switched: 0, gaveUp: 0 };
 
+	// ---- 常驻 footer 状态条：物理模型 + 熔断 + 重试（setStatus，不注入消息，不违反无感）----
+	let currentPhysical: string | undefined;
+	let retryInfo: string | undefined;
+	function updateFooter(ctx: any) {
+		if (!config.showStatus || !ctx?.ui?.setStatus) return;
+		const parts: string[] = [];
+		if (currentPhysical) parts.push(`物理=${currentPhysical}`);
+		if (retryInfo) parts.push(retryInfo);
+		const trips: string[] = [];
+		for (const [k, s] of breaker.circuits) {
+			if (s.state === "closed") continue;
+			if (s.state === "open") {
+				const secs = Math.max(0, Math.round((s.nextRetryTime - Date.now()) / 1000));
+				trips.push(`${k} 开(还${secs}s)`);
+			} else {
+				trips.push(`${k} ${s.state}`);
+			}
+		}
+		if (trips.length) parts.push(`熔断: ${trips.join("；")}`);
+		ctx.ui.setStatus("pi-resilience", parts.length ? parts.join(" | ") : undefined);
+	}
+
 	// ---- 熔断 / 冷却 ----
 	const keyOf = (m: { provider: string; id: string }) => `${m.provider}/${m.id}`;
 	const canAttempt = (key: string) => canAttemptCircuit(breaker, key, debug);
@@ -439,7 +461,8 @@ export default function (pi: ExtensionAPI) {
 				const why = timeoutFired
 					? `首字 ${Math.round(timeoutMs / 1000)}s 无响应`
 					: emptyFired ? "空响应" : `错误${lastStatus !== undefined ? `(HTTP ${lastStatus})` : ""}`;
-				ctx.ui?.setStatus?.("pi-resilience", `静默重试 #${attempt}（${why}，等 ${Math.round(delay / 1000)}s）`);
+				retryInfo = `重试 #${attempt}/${maxAttempts}（${why}，等 ${Math.round(delay / 1000)}s）`;
+				updateFooter(ctx);
 			}
 			await sleep(delay, userSignal);
 			if (userSignal?.aborted) return { status: "aborted" };
@@ -490,6 +513,11 @@ export default function (pi: ExtensionAPI) {
 		const userSignal = options?.signal;
 		const chain: Candidate[] = [];
 
+		// 常驻 footer：当前被派发的物理模型
+		currentPhysical = model ? `${model.provider}/${model.id}` : undefined;
+		retryInfo = undefined;
+		updateFooter(ctx);
+
 		// 被派发模型 = 主（produce 由调用方捕获原始 stream，防递归）
 		const dispatchedKey = model ? keyOf(model) : "unknown";
 		chain.push({
@@ -536,24 +564,31 @@ export default function (pi: ExtensionAPI) {
 						case "success":
 							if (!cand.isPrimary) {
 								stats.switched++;
-								if (config.showStatus) ctx.ui?.setStatus?.("pi-resilience", `已切备用模型 ${cand.label}`);
 							}
 							recordResult(cand.key, true);
+							retryInfo = undefined;
+							updateFooter(ctx);
 							out.end();
 							return;
 						case "aborted":
 							releaseProbe(cand.key);
 							stats.gaveUp++;
+							retryInfo = undefined;
+							updateFooter(ctx);
 							out.push(makeErrorEvent("已由用户取消"));
 							return;
 						case "committed":
 							recordFailure(cand.model ?? { provider: "?", id: "?" }, res.error);
 							recordResult(cand.key, false);
 							stats.gaveUp++;
+							retryInfo = undefined;
+							updateFooter(ctx);
 							out.push(makeErrorEvent(res.error));
 							return;
 						case "nonRetryable":
 							stats.gaveUp++;
+							retryInfo = undefined;
+							updateFooter(ctx);
 							out.push(makeErrorEvent(res.error));
 							return;
 						case "exhausted":
@@ -562,15 +597,20 @@ export default function (pi: ExtensionAPI) {
 							recordResult(cand.key, false);
 							errors.push(`${cand.label}: ${res.error}`);
 							if (i + 1 < chain.length) stats.failedOver++;
+							retryInfo = undefined;
+							updateFooter(ctx);
 							debug(`failover ${cand.label} -> ${chain[i + 1]?.label ?? "give up"}`);
 							continue;
 					}
 				}
 				// 全失败
 				stats.gaveUp++;
+				retryInfo = undefined;
+				updateFooter(ctx);
 				out.push(makeErrorEvent(errors.length > 0 ? errors.join("；") : "所有模型均不可用"));
 			} finally {
-				if (config.showStatus) ctx.ui?.setStatus?.("pi-resilience", undefined);
+				retryInfo = undefined;
+				updateFooter(ctx);
 			}
 		})().catch((err) => {
 			out.push(makeErrorEvent(err instanceof Error ? err.message : String(err)));
@@ -622,11 +662,15 @@ export default function (pi: ExtensionAPI) {
 		wrapProvider(ctx.model?.provider, ctx);
 		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
 		if (config.primary) wrapProvider(config.primary.provider, ctx);
+		currentPhysical = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+		updateFooter(ctx);
 	});
 	pi.on("model_select", async (event, ctx) => {
 		wrapProvider(event.model?.provider, ctx);
 		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
 		if (config.primary) wrapProvider(config.primary.provider, ctx);
+		currentPhysical = event.model ? `${event.model.provider}/${event.model.id}` : undefined;
+		updateFooter(ctx);
 	});
 
 	// ---- 虚拟模型 route：无缝换模型（pi 统计记实际 dispatch 的物理模型）----
