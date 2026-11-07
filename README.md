@@ -10,6 +10,7 @@ pi 的扩展工具包，内置多个**提效扩展**，主打**无感重试**—
 |---|---|---|
 | **pi-retry** | **错误** | 429 / `insufficient_quota` / 5xx / 网络 / 超时 / context overflow —— 一切报错都静默重试，绕过 pi 内核「配额类错误不可重试」判定 |
 | **pi-ttft** | **时间** | **首字太久**：首个真实 token 超过 `firstTokenTimeoutMs` 未出现 → abort 并静默重试；空响应也重试 |
+| **pi-breaker** | **熔断** | 某模型连续失败 → **熔断**（暂停使用 `resetTimeoutMs`），并**自动切到 `fallbackModels` 备用链**；临时错(network/timeout)用 5s 短冷却 |
 
 两者互补、可叠加：**pi-retry 管「报错就重试」，pi-ttft 管「不报错但半天不吐字就重试」**，合成「错误 + 首字」全覆盖。
 
@@ -86,18 +87,56 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 | `models` | `{}` | 按模型 glob 覆盖首字阈值，`*` 通配、大小写不敏感 |
 | `showStatus` | `true` | 状态栏显示 `静默重试 #n（首字 20s 无响应，等 Xs）` |
 
-## 工作原理（两者一致）
+## pi-breaker 配置（熔断 / 自动切模型）
+
+`~/.pi/pi-breaker.json`：
+
+```json
+{
+  "enabled": true,
+  "failureThreshold": 5,
+  "resetTimeoutMs": 120000,
+  "cooldownMs": 60000,
+  "fallbackModels": [
+    { "provider": "anthropic", "model": "claude-haiku-4-5" }
+  ],
+  "models": {},
+  "showStatus": true
+}
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `failureThreshold` | `5` | 连续失败多少次后熔断（`open`，暂停使用该模型） |
+| `resetTimeoutMs` | `120000` | **熔断多少秒恢复**：`open` 后等这么久才进 `half-open` 放一个探测请求；探测成功→`closed`（恢复），失败→再 `open` |
+| `cooldownMs` | `60000` | 单次失败后的冷却（ms）；临时错(network/timeout/临时鉴权)自动用 **5s** |
+| `fallbackModels` | `[]` | 熔断/失败后依次尝试的备用模型链，`{ provider, model }`；切模型用 `ctx.modelRegistry` |
+| `models` | `{}` | 按模型 glob 覆盖阈值（如 `{ "anthropic/claude*": { "resetTimeoutMs": 180000 } }`） |
+| `showStatus` | `true` | 状态栏显示进度 |
+
+> **熔断状态机**：`closed` →(连续失败≥阈值)→ `open`(拒绝) →(`resetTimeoutMs` 后)→ `half-open`(放 1 个探测) →(成功)→ `closed`，→(失败)→ 再 `open`。`half-open` 只放一个探测（防恢复风暴）。
+
+## 工作原理（三者一致）
 
 1. `session_start` / `model_select` 时拿到当前 provider，包装其 `stream` / `streamSimple`
 2. 每个请求包进重试循环，产出新的 `AssistantMessageEventStream`（官方工厂）
-3. 重试只发生在**尚未产出任何内容**时（内容无法安全重放）：
+3. 重试/切换只发生在**尚未产出任何内容**时（内容无法安全重放）：
    - pi-retry：错误事件且未产出内容 → 按策略重试
    - pi-ttft：首字超时 / 空响应 → 按退避重试
+   - pi-breaker：失败 → 计一次熔断失败 + 冷却 → 切下一个（`fallbackModels` 链）；熔断则跳过
 4. `pi.registerProvider()` 注册回 registry，对 pi 透明
 
 ### 唯一硬例外
 
-- **用户取消（abort）** —— 尊重用户意志，永不重试。
+- **用户取消（abort）** —— 尊重用户意志，永不重试、不计熔断失败。
+
+### 三者的分工（互补不重叠）
+
+| 扩展 | 范围 | 触发 | 干什么 |
+|---|---|---|---|
+| pi-retry | 单请求内 | 错误 | 同一模型静默重试（配额/429/5xx/网络/overflow） |
+| pi-ttft | 单请求内 | 首字太久/空响应 | 同一模型静默重试 |
+| pi-breaker | **跨请求** | 连续失败 | **熔断该模型 + 自动切备用模型** |
 
 ## 与 pi-quiver 的 provider-stall-watchdog 对比
 
@@ -109,6 +148,7 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 | 按模型覆盖 | 有（`models` glob） | 有（pi-ttft 的 `models` glob） |
 | 错误维度 | 不处理 | pi-retry 处理（mode/match/retry-after/overflow） |
 | 空响应 | 不专门处理 | pi-ttft `retryOnEmpty` |
+| 熔断+切模型 | 无 | **pi-breaker**（`closed/open/half-open` + `fallbackModels`） |
 
 ## 发布（Release）
 

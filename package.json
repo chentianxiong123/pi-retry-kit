@@ -12,7 +12,8 @@
   "pi": {
     "extensions": [
       "./extensions/pi-retry.ts",
-      "./extensions/pi-ttft.ts"
+      "./extensions/pi-ttft.ts",
+      "./extensions/pi-breaker.ts"
     ]
   },
   "peerDependencies": {
