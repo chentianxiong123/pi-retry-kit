@@ -40,7 +40,7 @@ export type TryResult =
 	| { status: "committed"; error: string; httpStatus?: number } // 已产出内容，不可重放
 	| { status: "aborted" }
 	| { status: "nonRetryable"; error: string; httpStatus?: number } // 非可重试类（鉴权/未知/部分 4xx）
-	| { status: "exhausted"; error: string; httpStatus?: number }; // 重试耗尽（模型判死刑）
+	| { status: "exhausted"; error: string; attempts: number; httpStatus?: number } // 重试耗尽（模型判死刑）
 
 export type Candidate = {
 	key: string;
@@ -219,10 +219,10 @@ export function createExecutor(deps: {
 
 			// 重试耗尽 / 累计上限 → 判死刑
 			if (attempt >= effectiveMax) {
-				return { status: "exhausted", error: haveError ? errorText : emptyFired ? "空响应" : "流意外结束", httpStatus: lastStatus };
+					return { status: "exhausted", error: haveError ? errorText : emptyFired ? "空响应" : "流意外结束", attempts: attempt, httpStatus: lastStatus };
 			}
 			if (config.retry.maxTotalWaitMs > 0 && Date.now() - t0 >= config.retry.maxTotalWaitMs) {
-				return { status: "exhausted", error: "达到累计等待上限" };
+				return { status: "exhausted", error: "达到累计等待上限", attempts: attempt, httpStatus: lastStatus };
 			}
 
 			// 退避等待后重试
@@ -303,12 +303,15 @@ export function createExecutor(deps: {
 			const safeCtx = ctxStale ? undefined : ctx;
 			try {
 				const errors: string[] = [];
+				// 被熔断/冷却挡下的候选也要留字：否则全 skip → errors 空 → 用户只看到「所有模型均不可用」这种废话
+				const skipped: string[] = [];
 				for (let i = 0; i < chain.length; i++) {
 					const cand = chain[i];
-
-					// ① 熔断 / 冷却检查
-					if (reliability.inCooldown(cand.key)) { debug(`skip ${cand.label}: in cooldown`); continue; }
-					if (!reliability.canAttempt(cand.key)) { debug(`skip ${cand.label}: circuit open`); continue; }
+					const circuit = reliability.breaker.circuits.get(cand.key);
+					const secsLeft = circuit ? Math.max(0, Math.round((circuit.nextRetryTime - Date.now()) / 1000)) : 0;
+					// ① 熔断 / 冷却检查（跳过也留原因）
+					if (reliability.inCooldown(cand.key)) { skipped.push(`${cand.label}: 冷却中(还${secsLeft}s)`); debug(`skip ${cand.label}: in cooldown (${secsLeft}s)`); continue; }
+					if (!reliability.canAttempt(cand.key)) { skipped.push(`${cand.label}: 熔断开(还${secsLeft}s)`); debug(`skip ${cand.label}: circuit open (${secsLeft}s)`); continue; }
 
 					// ② 重试 + 首字看门狗（同一循环；备用也走同逻辑）
 					const budget = cand.isPrimary ? config.retry.maxAttempts : config.fallback.maxAttempts;
@@ -351,7 +354,8 @@ export function createExecutor(deps: {
 							// ③ 重试耗尽 → 熔断（判死刑）→ 切下一个
 							if (cand.model) reliability.recordFailure(cand.model, res.error, res.httpStatus);
 							reliability.recordResult(cand.key, false);
-							errors.push(`${cand.label}: ${res.error}`);
+							const cls = classifyFailure(res.error, res.httpStatus);
+							errors.push(`${cand.label}: ${res.error}（试 ${res.attempts} 次 [${cls.kind}]）`);
 							if (i + 1 < chain.length) stats.failedOver++;
 							footer.clearRetryInfo();
 							footer.updateFooter(safeCtx);
@@ -364,7 +368,9 @@ export function createExecutor(deps: {
 				footer.stopTurnTimer();
 				footer.clearRetryInfo();
 				footer.updateFooter(safeCtx);
-				out.push(makeErrorEvent(errors.length > 0 ? errors.join("；") : "所有模型均不可用"));
+				out.push(makeErrorEvent(errors.length > 0 ? errors.join("；")
+					: skipped.length > 0 ? skipped.join("；")
+					: "所有模型均不可用"));
 			} finally {
 				footer.stopTurnTimer();
 				footer.clearRetryInfo();

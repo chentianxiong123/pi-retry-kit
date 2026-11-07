@@ -1,7 +1,7 @@
 {
   "name": "pi-retry-kit",
   "private": false,
-  "version": "0.7.0",
+  "version": "0.7.1",
   "type": "module",
   "description": "Resilience plugin for pi: silent unconditional retry + first-token watchdog + circuit breaker / auto model failover, in one request-layer wrapper. No messages injected, no reliance on pi built-in retry.",
   "keywords": [

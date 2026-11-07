@@ -27,6 +27,11 @@ function setup() {
 	const ex = createExecutor({ config, reliability, footer, stats, origStreams: new Map() });
 	return { config, stats, reliability, footer, ex };
 }
+async function collect(stream: any): Promise<any[]> {
+	const evs: any[] = [];
+	for await (const e of stream) evs.push(e);
+	return evs;
+}
 function makeOut() {
 	const evs: any[] = [];
 	return {
@@ -185,5 +190,40 @@ describe("边界：sleep abort", () => {
 		const t0 = Date.now();
 		await sleep(5000, ctrl.signal);
 		expect(Date.now() - t0).toBeLessThan(2000);
+	});
+});
+
+// ============================================================================
+// 「用户看不到原因」回归（2026-11-07 实证）：候选被熔断/冷却 skip 时若不留字，
+// errors 空 → 终末消息落在「所有模型均不可用」废话上，真实原因全丢。
+// ============================================================================
+describe("终末失败必须带原因（不能只说「所有模型均不可用」）", () => {
+	const always503 = () =>
+		scriptStream([errorEvent("mock 503 unavailable"), doneEvent()]);
+	test("首次失败：错误行含模型名 + 尝试次数 + 分类", async () => {
+		const { ex } = setup();
+		const evts = await collect(ex.resilienceStream(always503, { provider: "fake", id: "m1" } as any, undefined, undefined));
+		console.log("EVENTS:", JSON.stringify(evts.map((e) => e.type).join(","), null, 0));
+		const errs = evts.filter((e) => e.type === "error");
+		expect(errs.length).toBe(1);
+		const msg = (errs[0] as any).error?.errorMessage as string;
+		expect(msg).toContain("fake/m1");
+		expect(msg).toContain("503");
+		expect(msg).toContain(`试 ${DEFAULT_CONFIG.retry.maxAttempts} 次`);
+		expect(msg).toContain("[provider]");
+		expect(msg).not.toBe("所有模型均不可用");
+	});
+	test("二次进入（熔断开）：终末消息必须是「熔断开(还Ns)」而非废话", async () => {
+		const { ex } = setup(); // 每例独立 breaker
+		// 第 1 轮：打满 maxAttempts 次 503 → 熔断开（threshold=1）
+		await collect(ex.resilienceStream(always503, { provider: "fake", id: "m1" } as any, undefined, undefined));
+		// 第 2 轮：同一 breaker，候选被 skip
+		const evts2 = await collect(ex.resilienceStream(always503, { provider: "fake", id: "m1" } as any, undefined, undefined));
+		const errs2 = evts2.filter((e) => e.type === "error");
+		expect(errs2.length).toBe(1);
+		const msg = (errs2[0] as any).error?.errorMessage as string;
+		expect(msg).not.toBe("所有模型均不可用");
+		expect(msg).toContain("fake/m1");
+		expect(msg).toMatch(/(冷却中|熔断开)\(还\d+s\)/); // 冷却先于熔断，两者都算有效诊断
 	});
 });
