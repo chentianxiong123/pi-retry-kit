@@ -43,6 +43,13 @@ export default function (pi: ExtensionAPI) {
 	const footer = createFooter(config, reliability);
 	const executor = createExecutor({ config, reliability, footer, stats, origStreams });
 
+	// 当前会话的「活 ctx」：由 session_start / model_select 持续更新。
+	// wrapProvider 的 base.stream 闭包不能捕获 wrapProvider 传入的 ctx（reload 后该 ctx 会变 stale，
+	// 且 wrappedProviders.has() 会阻止重新 wrap，导致闭包永久持有旧 ctx → 下次请求时访问
+	// ctx.modelRegistry getter 抛 "extension ctx is stale" → pi 注入无 usage 的 assistant error 消息
+	// → getSessionStats 崩溃）。因此改为在调用时读取 activeCtx（始终是最新的有效 ctx）。
+	let activeCtx: any;
+
 	/** 包装指定 provider：覆盖 stream / streamSimple，注册回 registry */
 	function wrapProvider(providerId: string | undefined, ctx: any) {
 		if (!config.enabled || !providerId || wrappedProviders.has(providerId)) return;
@@ -62,7 +69,7 @@ export default function (pi: ExtensionAPI) {
 					model ? { provider: model.provider, id: model.id } : undefined,
 					context,
 					options,
-					ctx,
+					activeCtx ?? ctx,
 				);
 		}
 		if (origSimple) {
@@ -72,7 +79,7 @@ export default function (pi: ExtensionAPI) {
 					model ? { provider: model.provider, id: model.id } : undefined,
 					context,
 					options,
-					ctx,
+					activeCtx ?? ctx,
 				);
 		}
 
@@ -81,7 +88,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---- 会话开始 / 模型切换时包装当前 provider（含全部备用 provider，防切过去后失去保护）----
+	// 每次事件都刷新 activeCtx（事件回调的 ctx 是当前有效 ctx），wrapProvider 的闭包因此
+	// 始终读到最新 ctx，不会在 reload 后误用 stale ctx。
 	pi.on("session_start", async (_event, ctx) => {
+		activeCtx = ctx;
 		wrapProvider(ctx.model?.provider, ctx);
 		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
 		if (config.primary) wrapProvider(config.primary.provider, ctx);
@@ -89,6 +99,7 @@ export default function (pi: ExtensionAPI) {
 		footer.updateFooter(ctx);
 	});
 	pi.on("model_select", async (event, ctx) => {
+		activeCtx = ctx;
 		wrapProvider(event.model?.provider, ctx);
 		for (const fb of config.fallback.models) wrapProvider(fb.provider, ctx);
 		if (config.primary) wrapProvider(config.primary.provider, ctx);

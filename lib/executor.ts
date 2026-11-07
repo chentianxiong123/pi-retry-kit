@@ -261,21 +261,30 @@ export function createExecutor(deps: {
 		});
 
 		// 其余候选（primary + fallbacks，去掉被派发模型；走原始流；透传同一 context = 无缝）
-		for (const c of buildCandidates(ctx)) {
-			if (c.key === dispatchedKey) continue;
-			const fbProvider = ctx.modelRegistry?.getProvider(c.model.provider);
-			if (!fbProvider) continue;
-			const orig = origStreams.get(c.model.provider);
-			chain.push({
-				key: c.key,
-				label: c.label,
-				model: { provider: c.model.provider, id: c.model.id },
-				isPrimary: false,
-				produce: () =>
-					orig?.stream
-						? orig.stream.call(fbProvider, c.model, context, options)
-						: fbProvider.stream(c.model, context, options),
-			});
+		// 防御：ctx 可能因 session 替换 / reload 已 stale。访问 ctx.modelRegistry 的 getter 会
+		// assertActive() 抛 "extension ctx is stale"。这里 try/catch 兜住：stale 时跳过 fallback
+		// 候选（只用主 produce），绝不把 stale 错误抛给 pi（那会注入无 usage 的 assistant error
+		// 消息 → getSessionStats 崩溃）。
+		try {
+			for (const c of buildCandidates(ctx)) {
+				if (c.key === dispatchedKey) continue;
+				const fbProvider = ctx.modelRegistry?.getProvider(c.model.provider);
+				if (!fbProvider) continue;
+				const orig = origStreams.get(c.model.provider);
+				chain.push({
+					key: c.key,
+					label: c.label,
+					model: { provider: c.model.provider, id: c.model.id },
+					isPrimary: false,
+					produce: () =>
+						orig?.stream
+							? orig.stream.call(fbProvider, c.model, context, options)
+							: fbProvider.stream(c.model, context, options),
+				});
+			}
+		} catch (e) {
+			// ctx stale：放弃 fallback 候选，只用主 produce（主 produce 不访问 ctx.modelRegistry，安全）。
+			debug(`resilienceStream: skip fallback candidates (ctx stale): ${e instanceof Error ? e.message : String(e)}`);
 		}
 
 		(async () => {
