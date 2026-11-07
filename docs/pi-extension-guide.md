@@ -264,6 +264,34 @@ tsc -p tsconfig.check.json && bun build extensions/pi-resilience.ts --external '
 
 ---
 
+## 附：分层参考（B 方案重构后）
+
+> 原 815 行单文件拆成 6 层模块（`3685d1a`），**行为不变**，只是职责解耦。想给 pi 插件做分层，照这个边界切：
+
+```
+extensions/pi-resilience.ts   ← 接入层（入口）：wrapProvider + route + 事件 + 命令，只做组装
+lib/config.ts                 ← 配置层：类型 + 默认值 + 加载（deep merge）
+lib/core.ts                   ← 纯决策/工具层：sleep/pattern/事件判定 +
+                                  shouldRetry/computeDelay/ttftTimeoutFor（无状态纯函数）
+lib/reliability.ts            ← 熔断决策层：电路状态 + 冷却 + canAttempt/recordResult/isHealthy
+lib/present.ts                ← 呈现层：footer 状态条（秒表/物理/熔断/重试）+ 定时器生命周期
+lib/executor.ts               ← 执行层：tryCandidate（重试+看门狗循环）+ resilienceStream（候选链级联）
+lib/circuit-breaker.ts        ← 底层熔断器（零依赖）
+lib/failure-classifier.ts     ← 失败分类
+```
+
+**职责边界（各司其职，别串）**：
+
+- **决策函数**（core）做成纯函数、传 `config.retry` 段参数 → 可单测；
+- **熔断状态**（breaker+cooldowns）收进 reliability，唯一裁决「某模型还行不行」；
+- **footer 状态 + 定时器**收进 present（含 stale-ctx 三件套：footerCtx + try/catch + dispose）；
+- **执行**（重试/看门狗/级联）在 executor，只调 reliability 决策 + footer 呈现，不碰状态；
+- **入口**只组装，无业务逻辑。
+
+**依赖方向**：`入口 → config/core/reliability/present/executor`；`executor → config/core/reliability/present`；`present → config/reliability`；`reliability → config/core`。
+
+---
+
 ## 一句话总结
 
 > pi 插件 = `export default function(pi)` + 在 `extensions/` 目录（symlink 到仓库）里被 jiti 加载；**选模型用官方 `registerVirtualModel().route()`（无缝 + 统计记对），重试用请求层包装 provider.stream（静默）**；**凡是异步闭包捕获 ctx，一律改用「最近有效 ctx」+ 生命周期 dispose**——这是这次最大的坑。
