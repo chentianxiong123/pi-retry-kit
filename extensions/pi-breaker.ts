@@ -68,8 +68,11 @@ interface BreakerConfig {
 
 const DEFAULT_CONFIG: BreakerConfig = {
 	enabled: true,
-	failureThreshold: 5,
+	/** 连续失败多少次后熔断（open）。因内部重试已滤掉瞬时错，2 次决定性失败≈模型已挂 */
+	failureThreshold: 2,
+	/** 熔断后多少 ms 恢复（open → half-open 探测） */
 	resetTimeoutMs: 120_000,
+	/** 单次失败后的冷却（ms）；临时错(network/timeout/鉴权)自动用 5s */
 	cooldownMs: 60_000,
 	fallbackModels: [],
 	models: {},

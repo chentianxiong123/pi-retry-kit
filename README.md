@@ -107,7 +107,7 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `failureThreshold` | `5` | 连续失败多少次后熔断（`open`，暂停使用该模型） |
+| `failureThreshold` | `2` | 连续失败多少次后熔断（`open`，暂停使用该模型）。因内部重试已滤掉瞬时错，**2 次决定性失败≈模型已挂**；设 `1` = 一次就熔断 |
 | `resetTimeoutMs` | `120000` | **熔断多少秒恢复**：`open` 后等这么久才进 `half-open` 放一个探测请求；探测成功→`closed`（恢复），失败→再 `open` |
 | `cooldownMs` | `60000` | 单次失败后的冷却（ms）；临时错(network/timeout/临时鉴权)自动用 **5s** |
 | `fallbackModels` | `[]` | 熔断/失败后依次尝试的备用模型链，`{ provider, model }`；切模型用 `ctx.modelRegistry` |
