@@ -13,6 +13,7 @@ import {
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { hub, type ModelInfo } from "../lib/resilience.js";
 
 // ============================================================================
 // pi-retry —— 请求层无条件静默重试（包装 provider stream）
@@ -241,6 +242,7 @@ export default function (pi: ExtensionAPI) {
 	 */
 	function retryStream(
 		produce: () => AssistantMessageEventStream,
+		modelInfo: ModelInfo,
 		options: StreamOptions | undefined,
 		ctx: any,
 	): AssistantMessageEventStream {
@@ -342,11 +344,13 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (attempt >= config.maxAttempts) {
 					stats.gaveUp++;
+					if (modelInfo) hub.noteExhausted(modelInfo, errText, attempt);
 					out.push(lastErrorEvent);
 					return;
 				}
 				if (config.maxTotalWaitMs > 0 && Date.now() - startedAt >= config.maxTotalWaitMs) {
 					stats.gaveUp++;
+					if (modelInfo) hub.noteExhausted(modelInfo, errText, attempt);
 					out.push(lastErrorEvent);
 					return;
 				}
@@ -390,11 +394,21 @@ export default function (pi: ExtensionAPI) {
 
 		if (origStream) {
 			base.stream = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
-				retryStream(() => origStream.call(base, model, context, options), options, ctx);
+				retryStream(
+					() => origStream.call(base, model, context, options),
+					model ? { provider: model.provider, id: model.id } : undefined,
+					options,
+					ctx,
+				);
 		}
 		if (origSimple) {
 			base.streamSimple = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
-				retryStream(() => origSimple.call(base, model, context, options), options, ctx);
+				retryStream(
+					() => origSimple.call(base, model, context, options),
+					model ? { provider: model.provider, id: model.id } : undefined,
+					options,
+					ctx,
+				);
 		}
 
 		pi.registerProvider(base);

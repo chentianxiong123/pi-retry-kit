@@ -112,7 +112,7 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 | `resetTimeoutMs` | `120000` | **熔断多少秒恢复**：`open` 后等这么久才进 `half-open` 放一个探测请求；探测成功→`closed`（恢复），失败→再 `open` |
 | `cooldownMs` | `60000` | 单次失败后的冷却（ms）；临时错(network/timeout/临时鉴权)自动用 **5s** |
 | `fallbackModels` | `[]` | 熔断/失败后依次尝试的备用模型链，`{ provider, model }`；切模型用 `ctx.modelRegistry` |
-| `models` | `{}` | 按模型 glob 覆盖阈值（如 `{ "anthropic/claude*": { "resetTimeoutMs": 180000 } }`） |
+| `models` | `{}` | 按模型 glob 覆盖**冷却**（如 `{ "anthropic/claude*": { "cooldownMs": 180000 } }`）；`failureThreshold`/`resetTimeoutMs` 因熔断器全局共享，**不按模型覆盖** |
 | `showStatus` | `true` | 状态栏显示进度 |
 
 > **熔断状态机**：`closed` →(连续失败≥阈值)→ `open`(拒绝) →(`resetTimeoutMs` 后)→ `half-open`(放 1 个探测) →(成功)→ `closed`，→(失败)→ 再 `open`。`half-open` 只放一个探测（防恢复风暴）。
@@ -139,14 +139,15 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 | pi-ttft | 单请求内 | 首字太久/空响应 | 同一模型静默重试 |
 | pi-breaker | **跨请求** | 连续失败 | **熔断该模型 + 自动切备用模型** |
 
-### 三者可独立使用（互不耦合）
+### 三者耦合为一个系统（一个项目，共享 hub）
 
-- **零跨扩展 import**：`pi-retry.ts` / `pi-ttft.ts` / `pi-breaker.ts` 互不引用；`pi-breaker` 只依赖 `lib/`（熔断器/分类器，**无状态纯函数**，作为共享库而非扩展耦合）。
-- **各自独立配置**：`~/.pi/pi-retry.json`、`~/.pi/pi-ttft.json`、`~/.pi/pi-breaker.json`。
-- **可单独加载**：`pi.extensions` 里只留一个也能跑——它们各自包装 provider stream，不检测对方是否存在。
-- **级联只需「加载顺序」**：要完整级联（重试→耗尽→熔断→降级），三个都要加载，且 `pi-breaker` 在列表**最后**（最外层）。
+三者通过 `lib/resilience.ts` 的 **hub 单例**相互调通（一个项目 = 一个系统）：
 
-> **独立使用的唯一注意**：`failureThreshold=1` 是为级联校准的（重试耗尽=判死刑）。若**只装 pi-breaker**（无 pi-retry/pi-ttft），单次瞬时 5xx 也会立即熔断；此时建议把 `failureThreshold` 调高（如 `3`），或接受「熔得狠、恢复快」的激进策略。
+- **共享状态**：同一个熔断器（`hub.breaker`）、同一份配置（`hub.config`）、同一份会话统计（`hub.stats`）。
+- **重试层 → 熔断层显式上报**：`pi-retry` / `pi-ttft` 耗尽重试时调用 `hub.noteExhausted(模型, 错误, 次数)`，**显式声明「此模型已被证明不行」**；`pi-breaker` 失败时 `hub.takeExhausted(键)` 消费该信号（15s 内有效），明确区分「重试耗尽（判死刑）」vs「单次失败」。
+- **加载顺序仍是级联关键**：`pi-retry` → `pi-ttft` → `pi-breaker`（最后 = 最外层）。重试层在内部把同模型试到耗尽，熔断层在最外层看到最终结果并决策。
+
+> **因为耦合，`failureThreshold=1` 完全成立**：重试层已把模型试到耗尽（10s~15min）才上报失败，熔断层收到的是「判死刑」信号，一次即熔断。不再存在「单次瞬时 5xx 误熔断」问题——那是重试层的活。
 
 ## 与 pi-quiver 的 provider-stall-watchdog 对比
 

@@ -9,6 +9,7 @@ import {
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { hub } from "../lib/resilience.js";
 
 // ============================================================================
 // pi-ttft —— 首字（time-to-first-token）看门狗：请求层静默重试
@@ -303,17 +304,16 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (attempt >= config.maxAttempts) {
 						stats.gaveUp++;
-						out.push(
-							makeErrorEvent(
-								timeoutFired
-									? `首字超时（${Math.round(timeoutMs / 1000)}s 无响应），重试 ${config.maxAttempts} 次仍失败`
-									: `空响应，重试 ${config.maxAttempts} 次仍失败`,
-							),
-						);
+						const why = timeoutFired
+							? `首字超时（${Math.round(timeoutMs / 1000)}s 无响应）`
+							: "空响应";
+						if (modelInfo) hub.noteExhausted(modelInfo, `${why}，重试 ${config.maxAttempts} 次仍失败`, attempt);
+						out.push(makeErrorEvent(`${why}，重试 ${config.maxAttempts} 次仍失败`));
 						return;
 					}
 					if (config.maxTotalWaitMs > 0 && Date.now() - startedAt >= config.maxTotalWaitMs) {
 						stats.gaveUp++;
+						if (modelInfo) hub.noteExhausted(modelInfo, "达到累计等待上限", attempt);
 						out.push(makeErrorEvent("达到累计等待上限，放弃重试"));
 						return;
 					}
