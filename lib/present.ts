@@ -88,7 +88,46 @@ export function createFooter(config: ResilienceConfig, reliability: Reliability)
 		}
 	}
 
+	/**
+	 * 有没有「footer 可用」的 UI（ctx.ui.setStatus 存在且 showStatus 开）。
+	 * stale / print 模式 → false → 走 stderr 一句话播报（治「print 下重试静默救回」）。
+	 */
+	function hasFooterUi(ctx?: any): boolean {
+		const target = ctx ?? footerCtx;
+		if (!target) return false;
+		// 官方判据必须是 ctx.hasUI：print / rpc 模式下 ctx.ui 是 noOpUIContext，
+		// setStatus 存在但**是空函数**——靠「ui.setStatus 在不在」根本分不清 TUI 和非交互。
+		if (typeof target.hasUI === "boolean") return target.hasUI;
+		return Boolean(target.ui?.setStatus);
+	}
+
+	/** 非 TUI 且 showStatus 开 → 该用 stderr 播报一行（TUI 由 footer 说话，print 没人说） */
+	function shouldAnnounce(ctx?: any): boolean {
+		if (!config.showStatus) return false; // 用户主动关 → 闭嘴（footer 和 stderr 都闭嘴）
+		return !hasFooterUi(ctx);
+	}
+
+	/**
+	 * 非 TUI 环境（pi --print / showStatus=false / stale ctx）下，用一行说明「刚刚发生了什么」。
+	 * 写 stderr 不写 stdout：stdout 在 --output-format json 下是要被解析的，塞一行进去会直接坏掉。
+	 * 一次成功（attempts<=1）或 TUI footer 可见 → 完全静默（保持无感）。
+	 */
+	function announce(kind: "recovered" | "failover", label: string, attempts?: number, ctx?: any) {
+		if (!shouldAnnounce(ctx)) return; // TUI：footer 已经说过了，闭嘴；showStatus=false 也闭嘴
+		let line: string;
+		if (kind === "recovered" && attempts && attempts > 1) {
+			line = `[pi-resilience] ${label} 重试 ${attempts - 1} 次后恢复`;
+		} else if (kind === "failover") {
+			line = `[pi-resilience] ${label}`; // 切模型：用户有权知道自己现在在跟谁说话
+		} else {
+			return; // 一次成功：静默
+		}
+		try { process.stderr.write(line + "\n"); } catch { /* stderr 挂了就放弃，绝不影响请求 */ }
+	}
+
 	return {
+		announce,
+		shouldAnnounce,
 		startTurnTimer,
 		stopTurnTimer,
 		disposeTurnTimer,

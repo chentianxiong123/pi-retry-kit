@@ -36,7 +36,7 @@ import type { Footer } from "./present.js";
 // ============================================================================
 
 export type TryResult =
-	| { status: "success" }
+	| { status: "success"; attempts: number }
 	| { status: "committed"; error: string; httpStatus?: number } // 已产出内容，不可重放
 	| { status: "aborted" }
 	| { status: "nonRetryable"; error: string; httpStatus?: number } // 非可重试类（鉴权/未知/部分 4xx）
@@ -186,7 +186,7 @@ export function createExecutor(deps: {
 				if (emitted || !(useTtft && config.ttft.retryOnEmpty)) {
 					if (attempt > 1) stats.recovered++;
 					footer.noteFirstToken(firstTokenThisTry);
-					return { status: "success" };
+					return { status: "success", attempts: attempt };
 				}
 				emptyFired = true; // 空响应 → 按 ttft.retryOnEmpty 重试
 			}
@@ -320,6 +320,7 @@ export function createExecutor(deps: {
 					switch (res.status) {
 						case "success":
 							if (!cand.isPrimary) stats.switched++;
+							footer.announce("recovered", cand.label, res.attempts, safeCtx);
 							reliability.recordResult(cand.key, true);
 							footer.stopTurnTimer();
 							footer.clearRetryInfo();
@@ -357,6 +358,7 @@ export function createExecutor(deps: {
 							const cls = classifyFailure(res.error, res.httpStatus);
 							errors.push(`${cand.label}: ${res.error}（试 ${res.attempts} 次 [${cls.kind}]）`);
 							if (i + 1 < chain.length) stats.failedOver++;
+							if (i + 1 < chain.length) footer.announce("failover", `主模型 ${cand.label} 不可用，切到 ${chain[i + 1].label}`, undefined, safeCtx);
 							footer.clearRetryInfo();
 							footer.updateFooter(safeCtx);
 							debug(`failover ${cand.label} -> ${chain[i + 1]?.label ?? "give up"}`);

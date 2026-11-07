@@ -227,3 +227,57 @@ describe("终末失败必须带原因（不能只说「所有模型均不可用�
 		expect(msg).toMatch(/(冷却中|熔断开)\(还\d+s\)/); // 冷却先于熔断，两者都算有效诊断
 	});
 });
+
+
+// ============================================================================
+// announce：非 TUI（print）用 stderr 说一句话「刚刚发生了什么」。
+// 纯 present 层测试：announce 的职责是「判 UI 该不该说」，不依赖 executor 全链路
+// （那条链需要 pi 完整消息流，单测假体给不出 message.durationMs）。
+// ============================================================================
+describe("announce：print 有提示，TUI/关闭/一次成功 全静默", () => {
+	function cap() {
+		const lines: string[] = [];
+		const orig = process.stderr.write.bind(process.stderr);
+		(process.stderr as any).write = (c: any) => { lines.push(String(c)); return true; };
+		return { lines, restore: () => { (process.stderr as any).write = orig; } };
+	}
+	function footer(showStatus = true, hasUI = false) {
+		const cfg = { ...DEFAULT_CONFIG, showStatus };
+		const rel = createReliability(cfg as any);
+		const f = createFooter(cfg as any, rel);
+		const ctx: any = hasUI ? { hasUI: true, ui: { setStatus: () => {} } } : undefined;
+		return { f, ctx };
+	}
+	test("无 UI + 重试过（attempts>1）→ stderr 一行，带模型名和次数", () => {
+		const { f, ctx } = footer(true, false);
+		const c = cap();
+		try { f.announce("recovered", "fake/m1", 3, ctx); } finally { c.restore(); }
+		const got = c.lines.join("");
+		expect(got).toContain("[pi-resilience] fake/m1 重试 2 次后恢复");
+	});
+	test("一次成功（attempts<=1）→ 完全静默", () => {
+		const { f, ctx } = footer(true, false);
+		const c = cap();
+		try { f.announce("recovered", "fake/m1", 1, ctx); } finally { c.restore(); }
+		expect(c.lines.join("")).toBe("");
+	});
+	test("TUI（hasUI=true）→ 静默", () => {
+		const { f, ctx } = footer(true, true);
+		const c = cap();
+		try { f.announce("recovered", "fake/m1", 3, ctx); } finally { c.restore(); }
+		expect(c.lines.join("")).toBe("");
+	});
+	test("showStatus=false → 静默", () => {
+		const { f, ctx } = footer(false, false);
+		const c = cap();
+		try { f.announce("recovered", "fake/m1", 3, ctx); } finally { c.restore(); }
+		expect(c.lines.join("")).toBe("");
+	});
+	test("failover 播报（无论次数）", () => {
+		const { f, ctx } = footer(true, false);
+		const c = cap();
+		try { f.announce("failover", "主模型 fake/m1 不可用，切到 fake/m2", undefined, ctx); } finally { c.restore(); }
+		expect(c.lines.join("")).toContain("主模型 fake/m1 不可用，切到 fake/m2");
+	});
+});
+
