@@ -35,13 +35,13 @@ export function createReliability(config: ResilienceConfig) {
 		return true;
 	}
 
-	function recordFailure(m: { provider: string; id: string }, error: string): void {
+	function recordFailure(m: { provider: string; id: string }, error: string, statusCode?: number): void {
 		let cd = config.breaker.cooldownMs;
 		const label = `${m.provider}/${m.id}`;
 		for (const [pattern, o] of Object.entries(config.breaker.models)) {
 			if (modelPattern(pattern).test(label)) { cd = o.cooldownMs ?? cd; break; }
 		}
-		const { cooldownMs } = getFailureCooldownMs(error, cd);
+		const { cooldownMs } = getFailureCooldownMs(error, cd, statusCode);
 		cooldowns.set(keyOf(m), Date.now() + cooldownMs);
 	}
 

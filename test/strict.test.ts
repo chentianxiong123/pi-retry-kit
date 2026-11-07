@@ -111,6 +111,26 @@ describe("边界：熔断临界", () => {
 	});
 });
 
+describe("边界：precondition / safety 限量重试", () => {
+	test("400 safety check → 可重试但上限 3（不是 40）", async () => {
+		const { ex, stats } = setup();
+		const out = makeOut();
+		// maxAttempts 给 40，但分类器声明 precondition 上限 3 → 只尝试 3 次
+		const res = await ex.tryCandidate(() => scriptStream([errorEvent('400: {"message":"safety check failed","type":"failed_precondition_error","code":"9"}')]), { provider: "cpa", id: "m" }, undefined, out, {}, 40);
+		expect(res.status).toBe("exhausted");
+		expect(stats.attempts, "只应尝试 3 次（分类器上限），不是 40").toBe(3);
+		expect(stats.retried).toBe(2);
+	});
+
+	test("500 仍是 full budget（不受 precondition 上限影响）", async () => {
+		const { ex, stats } = setup();
+		const out = makeOut();
+		const res = await ex.tryCandidate(() => scriptStream([errorEvent("HTTP 500")]), { provider: "cpa", id: "m" }, undefined, out, {}, 5);
+		expect(res.status).toBe("exhausted");
+		expect(stats.attempts).toBe(5);
+	});
+});
+
 describe("边界：tryCandidate abort", () => {
 	test("userSignal 已 aborted → 返回 aborted，不重试不熔断", async () => {
 		const { ex, stats, reliability } = setup();

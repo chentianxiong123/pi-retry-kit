@@ -37,10 +37,10 @@ import type { Footer } from "./present.js";
 
 export type TryResult =
 	| { status: "success" }
-	| { status: "committed"; error: string } // 已产出内容，不可重放
+	| { status: "committed"; error: string; httpStatus?: number } // 已产出内容，不可重放
 	| { status: "aborted" }
-	| { status: "nonRetryable"; error: string } // 非可重试类（400/鉴权/未知）
-	| { status: "exhausted"; error: string }; // 重试耗尽（模型判死刑）
+	| { status: "nonRetryable"; error: string; httpStatus?: number } // 非可重试类（鉴权/未知/部分 4xx）
+	| { status: "exhausted"; error: string; httpStatus?: number }; // 重试耗尽（模型判死刑）
 
 export type Candidate = {
 	key: string;
@@ -118,6 +118,8 @@ export function createExecutor(deps: {
 
 		let attempt = 0;
 		let firstTokenThisTry = 0;
+		// 本次尝试的上限：分类器可为特定类别（如 precondition/safety）收紧它，但不放大超过调用方预算
+		let attemptMax = maxAttempts;
 		for (;;) {
 			attempt++;
 			stats.attempts++;
@@ -128,6 +130,8 @@ export function createExecutor(deps: {
 			let haveError = false;
 			let done = false;
 			let emptyFired = false;
+			// 本次出错时的实际上限（分类器收紧后 < maxAttempts）
+			const effectiveMax = attemptMax;
 
 			// 「内容前」事件缓冲：失败候选丢弃，成功候选才放行（无缝，避免重复 start）
 			const prelude: AssistantMessageEvent[] = [];
@@ -189,7 +193,7 @@ export function createExecutor(deps: {
 
 			// 已产出内容 → 不可重放（out 已放行内容，现在上交错误）
 			if (emitted) {
-				return { status: "committed", error: haveError ? errorText : "流中断（已产出内容）" };
+				return { status: "committed", error: haveError ? errorText : "流中断（已产出内容）", httpStatus: lastStatus };
 			}
 
 			// 首字超时（无内容、无错误）
@@ -200,20 +204,22 @@ export function createExecutor(deps: {
 
 			// 真正错误（非超时）且非可重试类 → 上交（丢弃 prelude）
 			if (haveError && !timeoutFired && !emptyFired) {
-				const cls = classifyFailure(errorText);
-				if (!cls.retryable) return { status: "nonRetryable", error: errorText };
-				if (!useRetry) return { status: "nonRetryable", error: errorText };
+				const cls = classifyFailure(errorText, lastStatus);
+				if (!cls.retryable) return { status: "nonRetryable", error: errorText, httpStatus: lastStatus };
+				if (!useRetry) return { status: "nonRetryable", error: errorText, httpStatus: lastStatus };
 				if (config.retry.retryOnOverflow === false && isContextOverflowText(errorText)) {
-					return { status: "nonRetryable", error: errorText };
+					return { status: "nonRetryable", error: errorText, httpStatus: lastStatus };
 				}
 				if (!shouldRetry(config.retry, lastStatus, errorText, compiledText)) {
-					return { status: "nonRetryable", error: errorText };
+					return { status: "nonRetryable", error: errorText, httpStatus: lastStatus };
 				}
+				// 分类器为这类错误声明了更严的上限（precondition/safety 默认 3）→ 收紧
+				if (cls.maxAttempts !== undefined) attemptMax = Math.min(attemptMax, cls.maxAttempts);
 			}
 
 			// 重试耗尽 / 累计上限 → 判死刑
-			if (attempt >= maxAttempts) {
-				return { status: "exhausted", error: haveError ? errorText : emptyFired ? "空响应" : "流意外结束" };
+			if (attempt >= effectiveMax) {
+				return { status: "exhausted", error: haveError ? errorText : emptyFired ? "空响应" : "流意外结束", httpStatus: lastStatus };
 			}
 			if (config.retry.maxTotalWaitMs > 0 && Date.now() - t0 >= config.retry.maxTotalWaitMs) {
 				return { status: "exhausted", error: "达到累计等待上限" };
@@ -326,7 +332,7 @@ export function createExecutor(deps: {
 							out.push(makeErrorEvent("已由用户取消"));
 							return;
 						case "committed":
-							reliability.recordFailure(cand.model ?? { provider: "?", id: "?" }, res.error);
+							reliability.recordFailure(cand.model ?? { provider: "?", id: "?" }, res.error, res.httpStatus);
 							reliability.recordResult(cand.key, false);
 							stats.gaveUp++;
 							footer.stopTurnTimer();
@@ -343,7 +349,7 @@ export function createExecutor(deps: {
 							return;
 						case "exhausted":
 							// ③ 重试耗尽 → 熔断（判死刑）→ 切下一个
-							if (cand.model) reliability.recordFailure(cand.model, res.error);
+							if (cand.model) reliability.recordFailure(cand.model, res.error, res.httpStatus);
 							reliability.recordResult(cand.key, false);
 							errors.push(`${cand.label}: ${res.error}`);
 							if (i + 1 < chain.length) stats.failedOver++;
