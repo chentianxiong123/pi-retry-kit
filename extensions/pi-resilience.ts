@@ -62,25 +62,37 @@ export default function (pi: ExtensionAPI) {
 
 		if (origStream) origStreams.set(providerId, { stream: origStream });
 
+		// 用「调用时」的最新 activeCtx，绝不用 wrap 时捕获的闭包 ctx（reload 后会 stale）。
+		// activeCtx 由 session_start / model_select 持续刷新为当前有效 ctx。
+		// 注意：这里**完全不捕获 wrapProvider 的参数 ctx**——它只用于上面的 getProvider（wrap 时有效），
+		// 不能进闭包。闭包只读 activeCtx（module 级，每次求值取最新），因此 reload 后绝不会用到 stale ctx。
+		// activeCtx 未初始化（reload 后新 session_start 尚未触发）→ undefined，调用方走「无保护但安全」路径。
+		const liveCtx = () => activeCtx;
 		if (origStream) {
-			base.stream = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
-				executor.resilienceStream(
+			base.stream = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) => {
+				const ctx = liveCtx();
+				if (!ctx) return origStream.call(base, model, context, options); // 无有效 ctx：原样，不包（安全）
+				return executor.resilienceStream(
 					() => origStream.call(base, model, context, options),
 					model ? { provider: model.provider, id: model.id } : undefined,
 					context,
 					options,
-					activeCtx ?? ctx,
+					ctx,
 				);
+			};
 		}
 		if (origSimple) {
-			base.streamSimple = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
-				executor.resilienceStream(
+			base.streamSimple = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) => {
+				const ctx = liveCtx();
+				if (!ctx) return origSimple.call(base, model, context, options);
+				return executor.resilienceStream(
 					() => origSimple.call(base, model, context, options),
 					model ? { provider: model.provider, id: model.id } : undefined,
 					context,
 					options,
-					activeCtx ?? ctx,
+					ctx,
 				);
+			};
 		}
 
 		pi.registerProvider(base);

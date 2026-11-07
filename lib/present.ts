@@ -82,8 +82,9 @@ export function createFooter(config: ResilienceConfig, reliability: Reliability)
 			if (trips.length) parts.push(`熔断: ${trips.join("；")}`);
 			target.ui.setStatus("pi-resilience", parts.length ? parts.join(" | ") : undefined);
 		} catch {
-			// ctx stale / 已销毁：放弃本次刷新（不注入错误消息，避免 pi 崩溃）。
-			if (ctx) footerCtx = undefined;
+			// ctx stale / 已销毁：放弃本次刷新，并清掉 footerCtx 引用（定时器路径也清），
+			// 防止后续每 500ms 的定时器反复访问已 stale 的 ctx（虽被 catch，但浪费）。
+			footerCtx = undefined;
 		}
 	}
 

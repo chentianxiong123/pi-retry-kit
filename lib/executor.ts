@@ -265,6 +265,9 @@ export function createExecutor(deps: {
 		// assertActive() 抛 "extension ctx is stale"。这里 try/catch 兜住：stale 时跳过 fallback
 		// 候选（只用主 produce），绝不把 stale 错误抛给 pi（那会注入无 usage 的 assistant error
 		// 消息 → getSessionStats 崩溃）。
+		// 同时把「是否 stale」结果传给后续 tryCandidate/footer，避免它们在 async 循环里
+		// 反复访问已 stale 的 ctx（footer 内部已 try/catch，但 tryCandidate 的 produce 可能访问）。
+		let ctxStale = false;
 		try {
 			for (const c of buildCandidates(ctx)) {
 				if (c.key === dispatchedKey) continue;
@@ -284,10 +287,14 @@ export function createExecutor(deps: {
 			}
 		} catch (e) {
 			// ctx stale：放弃 fallback 候选，只用主 produce（主 produce 不访问 ctx.modelRegistry，安全）。
+			ctxStale = true;
 			debug(`resilienceStream: skip fallback candidates (ctx stale): ${e instanceof Error ? e.message : String(e)}`);
 		}
 
 		(async () => {
+			// stale ctx 时降级为 undefined：后续所有 footer / tryCandidate 调用都走
+			// 安全路径（footer 无 ctx 即跳过刷新；tryCandidate 不再访问 stale ctx 的 getter）。
+			const safeCtx = ctxStale ? undefined : ctx;
 			try {
 				const errors: string[] = [];
 				for (let i = 0; i < chain.length; i++) {
@@ -299,7 +306,7 @@ export function createExecutor(deps: {
 
 					// ② 重试 + 首字看门狗（同一循环；备用也走同逻辑）
 					const budget = cand.isPrimary ? config.retry.maxAttempts : config.fallback.maxAttempts;
-					const res = await tryCandidate(cand.produce, cand.model, options, out, ctx, budget);
+					const res = await tryCandidate(cand.produce, cand.model, options, out, safeCtx, budget);
 
 					switch (res.status) {
 						case "success":
@@ -307,7 +314,7 @@ export function createExecutor(deps: {
 							reliability.recordResult(cand.key, true);
 							footer.stopTurnTimer();
 							footer.clearRetryInfo();
-							footer.updateFooter(ctx);
+							footer.updateFooter(safeCtx);
 							out.end();
 							return;
 						case "aborted":
@@ -315,7 +322,7 @@ export function createExecutor(deps: {
 							stats.gaveUp++;
 							footer.stopTurnTimer();
 							footer.clearRetryInfo();
-							footer.updateFooter(ctx);
+							footer.updateFooter(safeCtx);
 							out.push(makeErrorEvent("已由用户取消"));
 							return;
 						case "committed":
@@ -324,14 +331,14 @@ export function createExecutor(deps: {
 							stats.gaveUp++;
 							footer.stopTurnTimer();
 							footer.clearRetryInfo();
-							footer.updateFooter(ctx);
+							footer.updateFooter(safeCtx);
 							out.push(makeErrorEvent(res.error));
 							return;
 						case "nonRetryable":
 							stats.gaveUp++;
 							footer.stopTurnTimer();
 							footer.clearRetryInfo();
-							footer.updateFooter(ctx);
+							footer.updateFooter(safeCtx);
 							out.push(makeErrorEvent(res.error));
 							return;
 						case "exhausted":
@@ -341,7 +348,7 @@ export function createExecutor(deps: {
 							errors.push(`${cand.label}: ${res.error}`);
 							if (i + 1 < chain.length) stats.failedOver++;
 							footer.clearRetryInfo();
-							footer.updateFooter(ctx);
+							footer.updateFooter(safeCtx);
 							debug(`failover ${cand.label} -> ${chain[i + 1]?.label ?? "give up"}`);
 							continue;
 					}
@@ -350,12 +357,12 @@ export function createExecutor(deps: {
 				stats.gaveUp++;
 				footer.stopTurnTimer();
 				footer.clearRetryInfo();
-				footer.updateFooter(ctx);
+				footer.updateFooter(safeCtx);
 				out.push(makeErrorEvent(errors.length > 0 ? errors.join("；") : "所有模型均不可用"));
 			} finally {
 				footer.stopTurnTimer();
 				footer.clearRetryInfo();
-				footer.updateFooter(ctx);
+				footer.updateFooter(safeCtx);
 			}
 		})().catch((err) => {
 			out.push(makeErrorEvent(err instanceof Error ? err.message : String(err)));
