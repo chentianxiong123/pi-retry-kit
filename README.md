@@ -107,7 +107,8 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `failureThreshold` | `2` | 连续失败多少次后熔断（`open`，暂停使用该模型）。因内部重试已滤掉瞬时错，**2 次决定性失败≈模型已挂**；设 `1` = 一次就熔断 |
+| `failureThreshold` | `1` | 连续失败多少次后熔断（`open`，暂停使用该模型）。默认 **1**：重试耗尽仍失败 = 模型已挂，一次即熔断 |
+| —（护栏） | 仅可重试类 | **只有可重试类失败**（network/5xx/429/timeout/配额）才计入熔断；400/鉴权/未知（我们自己的 bug/配置）**不熔断好模型** |
 | `resetTimeoutMs` | `120000` | **熔断多少秒恢复**：`open` 后等这么久才进 `half-open` 放一个探测请求；探测成功→`closed`（恢复），失败→再 `open` |
 | `cooldownMs` | `60000` | 单次失败后的冷却（ms）；临时错(network/timeout/临时鉴权)自动用 **5s** |
 | `fallbackModels` | `[]` | 熔断/失败后依次尝试的备用模型链，`{ provider, model }`；切模型用 `ctx.modelRegistry` |
@@ -137,6 +138,15 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 | pi-retry | 单请求内 | 错误 | 同一模型静默重试（配额/429/5xx/网络/overflow） |
 | pi-ttft | 单请求内 | 首字太久/空响应 | 同一模型静默重试 |
 | pi-breaker | **跨请求** | 连续失败 | **熔断该模型 + 自动切备用模型** |
+
+### 三者可独立使用（互不耦合）
+
+- **零跨扩展 import**：`pi-retry.ts` / `pi-ttft.ts` / `pi-breaker.ts` 互不引用；`pi-breaker` 只依赖 `lib/`（熔断器/分类器，**无状态纯函数**，作为共享库而非扩展耦合）。
+- **各自独立配置**：`~/.pi/pi-retry.json`、`~/.pi/pi-ttft.json`、`~/.pi/pi-breaker.json`。
+- **可单独加载**：`pi.extensions` 里只留一个也能跑——它们各自包装 provider stream，不检测对方是否存在。
+- **级联只需「加载顺序」**：要完整级联（重试→耗尽→熔断→降级），三个都要加载，且 `pi-breaker` 在列表**最后**（最外层）。
+
+> **独立使用的唯一注意**：`failureThreshold=1` 是为级联校准的（重试耗尽=判死刑）。若**只装 pi-breaker**（无 pi-retry/pi-ttft），单次瞬时 5xx 也会立即熔断；此时建议把 `failureThreshold` 调高（如 `3`），或接受「熔得狠、恢复快」的激进策略。
 
 ## 与 pi-quiver 的 provider-stall-watchdog 对比
 

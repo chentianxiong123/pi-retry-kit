@@ -18,7 +18,7 @@ import {
 	releaseCircuitProbe,
 	type CircuitBreaker,
 } from "../lib/circuit-breaker.js";
-import { getFailureCooldownMs } from "../lib/failure-classifier.js";
+import { classifyFailure, getFailureCooldownMs } from "../lib/failure-classifier.js";
 
 // ============================================================================
 // pi-breaker —— 熔断器 + 熔断后自动切模型（请求层静默版）
@@ -68,8 +68,8 @@ interface BreakerConfig {
 
 const DEFAULT_CONFIG: BreakerConfig = {
 	enabled: true,
-	/** 连续失败多少次后熔断（open）。因内部重试已滤掉瞬时错，2 次决定性失败≈模型已挂 */
-	failureThreshold: 2,
+	/** 连续失败多少次后熔断（open）。默认 1：重试耗尽仍失败 = 模型已挂，一次即熔断 */
+	failureThreshold: 1,
 	/** 熔断后多少 ms 恢复（open → half-open 探测） */
 	resetTimeoutMs: 120_000,
 	/** 单次失败后的冷却（ms）；临时错(network/timeout/鉴权)自动用 5s */
@@ -311,16 +311,27 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
-					// 已产出内容：无法安全重放/切换 → 上交，但记录失败（计入熔断）
+					// 已产出内容：无法安全重放/切换 → 上交；可重试类失败才计入熔断
 					if (emitted) {
-						recordFailure(cand.key, attemptError);
-						recordCircuitResult(breaker, cand.key, false, debug);
+						if (classifyFailure(attemptError).retryable) {
+							recordFailure(cand.key, attemptError);
+							recordCircuitResult(breaker, cand.key, false, debug);
+						}
 						stats.gaveUp++;
 						out.push(makeErrorEvent(attemptError));
 						return;
 					}
 
-					// 未产出内容：记录失败 + 冷却 + 熔断计数，尝试下一个
+					// 非可重试类失败（400/鉴权/未知 = 我们自己的 bug/配置，不是模型挂）
+					// → 不上交、不切换、不熔断
+					if (!classifyFailure(attemptError).retryable) {
+						stats.gaveUp++;
+						out.push(makeErrorEvent(attemptError));
+						return;
+					}
+
+					// 可重试类失败（network/5xx/429/timeout/配额 = 模型/上游问题）
+					// → 冷却 + 熔断计数（1 次即熔断）+ 尝试下一个
 					recordFailure(cand.key, attemptError);
 					recordCircuitResult(breaker, cand.key, false, debug);
 					errors.push(`${cand.label}: ${attemptError}`);
