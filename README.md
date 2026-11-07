@@ -16,7 +16,7 @@ pi 内置 retry 只按「错误」分类重试，且把 `insufficient_quota` / `
 ## 安装
 
 ```bash
-pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
+pi install git:github.com/chentianxiong123/pi-retry-kit@v0.7.2
 ```
 
 > 或本地：`pi -e ./pi-retry-kit`。
@@ -86,6 +86,29 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
 | `respectRetryAfter` | `true` | 尊重服务端 `retry-after` 头 |
 | `retryOnOverflow` | `true` | 上下文溢出也重试（`false` = 快速失败给 compaction） |
 
+### 失败分类（错误码优先，限量重试）
+
+> **分类器只信数字 HTTP 状态码，不信错误文本**。文本匹配易碎（本地化/包装/改文案就漏），所以判定优先级：
+>
+> 1. **数字 HTTP 状态码**（executor 从 `onResponse` 拿 `resp.status`）——权威；
+> 2. **结构化 body 字段**（`{"type":"failed_precondition_error","code":"9"}`，机器可读）；
+> 3. **Node 网络码**（`ECONNREFUSED`/`ETIMEDOUT`/`socket hang up`）；
+> 4. **文本关键词**——仅兜底（状态码/body 都拿不到时）。
+
+| 类别 | 状态码 | 重试 | 上限 | 说明 |
+|---|---|---|---|---|
+| `auth` | 401 / 403 | ❌ | — | 坏凭证，重试无意义 |
+| `rate-limit` | 429 | ✅ | 配置 | 配额/限流，等退避可能自愈 |
+| `timeout` | 408 | ✅ | 配置 | 超时 |
+| `network` | —（连接错误） | ✅ | 配置 | `ECONNREFUSED`/`ECONNRESET` 等 |
+| `provider` | ≥500（500/502/503/504/524） | ✅ | 配置 | 服务端过载/内部错 |
+| **`precondition`** | **400 / 409 / 422** | ✅ | **3** | **内容/前置条件/安全校验类**：`failed_precondition_error`/`safety`/`content_filter`/`moderation`。**可能自愈但重满是浪费**——同样内容大概率同样被拒，所以限量 3 次（不是傻重 40 次） |
+| `abort` | — | ❌ | — | 用户取消，永不重试、不计熔断 |
+| `unknown` | 其余 4xx（404/413/451…） | ❌ | — | 请求本身有问题 |
+
+> **限量不放大**：分类器声明的 `maxAttempts`（如 precondition=3）executor **只收紧**（`min(maxAttempts, 分类器上限)`），绝不放大超配置预算。
+> **分类器一票否决**：`mode:"all"` 也管不了 `auth`(401/403) 和 `unknown`——坏凭证/未知重试无意义，设计如此。
+
 ### ttft（首字看门狗）
 
 | 字段 | 默认 | 说明 |
@@ -104,6 +127,8 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
 | `models` | `{}` | 按模型 glob 覆盖**冷却**（如 `{ "anthropic/claude*": { "cooldownMs": 180000 } }`） |
 
 > **熔断状态机**：`closed` →(连续失败≥阈值)→ `open`(拒绝) →(`resetTimeoutMs` 后)→ `half-open`(放 1 个探测) →(成功)→ `closed`，→(失败)→ 再 `open`。`half-open` 只放一个探测（防恢复风暴）。
+>
+> **哪些失败计入熔断**：只有**可重试类失败**（429/5xx/网络/超时/precondition）在重试耗尽后计入熔断；`auth`(401/403)、`unknown`、用户 `abort` **不计入**（这些重试无意义，是别的层的事，熔断它们会让模型被误判死刑）。
 
 ### fallback（备用模型链）
 
@@ -135,6 +160,23 @@ pi install git:github.com/chentianxiong123/pi-retry-kit@v0.5.0
 ### 无缝（切模型）
 `route()` 由 pi 在 dispatch 前调用，pi 把请求发到 route 选的物理模型——**选择（虚拟）与 dispatch（物理）分离**：用户无感，且 pi 的 assistant message / 统计记录物理模型。切到备用时透传同一个 `TranscriptContext`（完整对话）＋「内容前」事件缓冲（失败候选丢弃），无重复 `start`、无污染。
 
+## 可见性（什么时候有字）
+
+> 核心哲学是**无感**：重试/切换过程不注入消息、不打断对话。但「最终失败」和「非 TUI 环境」必须说人话，否则用户看到的是废纸。
+
+| 场景 | TUI（footer 常驻状态条） | print / `--mode json`（无 footer） |
+|---|---|---|
+| 重试中 | ✅ footer「重试 #2/20（错误HTTP 503，等3s）」 | ❌ 静默 |
+| 熔断/冷却 | ✅ footer「熔断开(还58s)」 | ❌ 静默 |
+| **救回成功** | ✅ footer「(重试1)」 | ✅ **stderr** `[pi-resilience] fake/m 重试 2 次后恢复` |
+| **切模型** | ✅ footer | ✅ **stderr** `[pi-resilience] 主模型 a 不可用，切到 b` |
+| **最终失败** | ✅ footer | ✅ **stderr** `fake/m: 503（试 20 次 [provider]）`——带模型名/次数/分类，不再只有「所有模型均不可用」 |
+| 用户取消 | ✅ `已由用户取消` | ✅ 同 |
+
+> **stderr 不写 stdout**：`--mode json` 下 stdout 被逐行解析，塞一行会破坏 JSON。
+> **TUI 判据是 `ctx.hasUI`**：print/rpc 下 `ctx.ui` 是 no-op（`setStatus` 存在但是空函数），靠「setStatus 在不在」分不清 TUI 和非交互。
+> **`showStatus:false`**：footer 和 stderr 播报**都闭嘴**（用户主动关，尊重）。
+
 ## 与 pi-quiver 的 provider-stall-watchdog 对比
 
 | 维度 | provider-stall-watchdog | **pi-resilience（本包）** |
@@ -158,7 +200,41 @@ bun build extensions/pi-resilience.ts --external '@earendil-works/*' --external 
 # tsc 严格检查（模块解析 Bundler，映射到全局安装的 pi 类型）
 ```
 
+## 测试（`bun test test/` = 73 项全绿）
+
+```bash
+bun test test/          # 一键回归：单元 + 熔断 + 执行 + 分类器 + smoke + strict
+bun test test/e2e.test.ts   # 端到端：真 pi + mock-server 假供应商
+```
+
+| 文件 | 测什么 |
+|---|---|
+| `test/core.test.ts` | 纯函数（退避/编译文本/首字阈值） |
+| `test/reliability.test.ts` | 熔断决策（closed/open/half-open，阈值/恢复） |
+| `test/executor.test.ts` | 执行层（fake-stream 可控事件流：重试/看门狗/熔断/切模型） |
+| `test/classify.test.ts` | 分类器码优先（status 覆盖误导文本 / IP 不误判 / body type 映射） |
+| `test/strict.test.ts` | 严格/边界（极端退避/空分类/abort/并发/熔断临界/失败可见性/announce） |
+| `test/smoke.test.ts` | 注册表面（API stub：虚拟模型/命令/事件注册） |
+| `test/e2e.test.ts` | 端到端（真 pi + mock-server，临时 `PI_CODING_AGENT_DIR`） |
+
+**测试哲学**（借鉴 jmcombs/pi-extensions，不 mock 外部 API）：
+
+- **只写有意义的测试**，不为覆盖率。纯函数/熔断/执行/分类器都测**决策**，不是测实现；
+- **mock-server 是失败注入**（合法）：脚本化 500/200 SSE 假供应商，测**容错**——这是插件的主业，不是 mock 外部 API；
+- **strict 测试必须能「测坏」**：极端参数、边界、并发、abort，专揪真实 bug（已揪出 `computeDelay` 负指数、`multiplier=0` 退避恒 0、`ECONNREFUSED 127` 被误判成 status、全失败只说废话 4 个）；
+- **端到端用 async `spawn`**（不是 `spawnSync`）：spawnSync 同步阻塞 bun 事件循环 → 同进程 mock-server 无法响应 pi 请求 → 卡死；
+- **E2E 真 LLM 不写进测试**：端到端真供应商手动 `pi -e` 验，CI 里只跑 mock-server。
+
+## 已修复的真实 bug（回归测试钉住的）
+
+- `computeDelay` 在 `attempt=0` 时负指数减半 → 修 `max(1, attempt)`；
+- `multiplier=0` 退避恒 0 → 修 `max(1, multiplier)`；
+- 分类器文本抠码把 `ECONNREFUSED 127.0.0.1:443` 的 **`127` 当 HTTP 状态码** → 网络错判 `unknown`；改白名单 + 码优先；
+- 全失败只说「所有模型均不可用」（候选被熔断/冷却 skip 时不留字，真实原因只在 debug 日志）→ 跳过也记原因，终末消息带模型名/次数/分类；
+- stale-ctx 崩溃：wrapProvider 闭包捕获 `ctx`（reload 后 stale）→ `assertActive()` 抛 → pi 注入无 usage 错误 → footer `getSessionStats` 读 `usage.input` 崩。已根治（闭包只读 module 级 `activeCtx`，不捕获 wrap 时的 ctx）；
+- pi 取消回合生成「已由用户取消」无 usage 消息 → 同崩法。已补零 usage。
+
 ## 发布（Release）
 
-- 主路径：`git tag v0.5.0 && git push --tags`（仓库 `chentianxiong123/pi-retry-kit`）；
+- 主路径：`git tag v0.7.2 && git push --tags`（仓库 `chentianxiong123/pi-retry-kit`）；
 - 备选：`npm publish`（包名 `pi-retry-kit` 未被占用，需 `npm login`）。
