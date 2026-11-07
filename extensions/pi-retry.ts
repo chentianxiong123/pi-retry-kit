@@ -1,5 +1,15 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+	createAssistantMessageEventStream,
+	type Api,
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
+	type Model,
+	type ProviderResponse,
+	type StreamOptions,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -124,11 +134,11 @@ function loadConfig(): { config: RetryConfig; compiled: RegExp[] } {
 /** 兼容 v0.1/v0.2 旧格式（顶层 baseDelayMs/maxDelayMs/contextOverflowFastFail） */
 function normalize(raw?: Partial<RetryConfig>): RetryConfig {
 	if (!raw) return structuredClone(DEFAULT_CONFIG);
-	if (!raw.backoff || typeof raw.backoff !== "object") raw.backoff = {};
+	const backoff = raw.backoff ?? {};
 	const cfg = {
 		...DEFAULT_CONFIG,
 		...raw,
-		backoff: { ...DEFAULT_CONFIG.backoff, ...raw.backoff },
+		backoff: { ...DEFAULT_CONFIG.backoff, ...backoff },
 	} as RetryConfig;
 
 	// 旧格式顶层字段映射
@@ -174,6 +184,7 @@ function isContextOverflowText(text: string): boolean {
 function makeErrorEvent(message: string): AssistantMessageEvent {
 	return {
 		type: "error",
+		reason: "error",
 		error: {
 			role: "assistant",
 			stopReason: "error",
@@ -242,7 +253,7 @@ export default function (pi: ExtensionAPI) {
 		const wrappedOptions = options
 			? {
 					...options,
-					onResponse: (resp: ProviderResponse, model: unknown) => {
+					onResponse: (resp: ProviderResponse, model: Model<Api>) => {
 						lastStatus = resp?.status;
 						if (config.respectRetryAfter && resp?.status === 429) {
 							const ra = resp.headers?.["retry-after"];
@@ -378,11 +389,11 @@ export default function (pi: ExtensionAPI) {
 		if (!origStream && !origSimple) return;
 
 		if (origStream) {
-			base.stream = (model: unknown, context: unknown, options?: StreamOptions) =>
+			base.stream = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
 				retryStream(() => origStream.call(base, model, context, options), options, ctx);
 		}
 		if (origSimple) {
-			base.streamSimple = (model: unknown, context: unknown, options?: StreamOptions) =>
+			base.streamSimple = (model: Model<Api>, context: TranscriptContext, options?: StreamOptions) =>
 				retryStream(() => origSimple.call(base, model, context, options), options, ctx);
 		}
 
