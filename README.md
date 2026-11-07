@@ -1,4 +1,4 @@
-# pi-retry
+# pi-retry-kit
 
 **提效工具包：上游请求「错误」与「首字」双维度的静默重试，一个包搞定。**
 
@@ -16,7 +16,7 @@ pi 的扩展工具包，内置多个**提效扩展**，主打**无感重试**—
 ## 安装
 
 ```bash
-pi install git:github.com/chentianxiong123/pi-retry@v0.4.0
+pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
 ```
 
 安装后 `/reload` 生效。查看配置与统计：`/pi-retry`、`/pi-ttft`
@@ -101,7 +101,7 @@ pi install git:github.com/chentianxiong123/pi-retry@v0.4.0
 
 ## 与 pi-quiver 的 provider-stall-watchdog 对比
 
-| 维度 | provider-stall-watchdog | **pi-retry（本包）** |
+| 维度 | provider-stall-watchdog | **pi-retry-kit（本包）** |
 |---|---|---|
 | 静默 | 会 `pi.sendMessage` 注入合成消息，借 pi 内置 retry | **完全静默**，无消息、无注入、不依赖 pi 内置 retry |
 | 重试归属 | 借 pi 内置 retry（预算默认 3） | **自己管重试循环**（`maxAttempts` 默认 20） |
@@ -109,6 +109,31 @@ pi install git:github.com/chentianxiong123/pi-retry@v0.4.0
 | 按模型覆盖 | 有（`models` glob） | 有（pi-ttft 的 `models` glob） |
 | 错误维度 | 不处理 | pi-retry 处理（mode/match/retry-after/overflow） |
 | 空响应 | 不专门处理 | pi-ttft `retryOnEmpty` |
+
+## 发布（Release）
+
+本包走 **git tag 发行**（与 `pi install git:...` 配套），也可走 npm。发布步骤：
+
+```bash
+# 1) 推代码到 GitHub 仓库 chentianxiong123/pi-retry-kit
+pi-retry-kit> git push -u origin main
+
+# 2) 打版本 tag（版本号与 package.json 一致）
+pi-retry-kit> git tag v0.4.0
+pi-retry-kit> git push origin v0.4.0
+
+# 3) 用户安装
+pi install git:github.com/chentianxiong123/pi-retry-kit@v0.4.0
+```
+
+npm 备选（包名 `pi-retry-kit` 当前未被占用）：
+
+```bash
+pi-retry-kit> npm publish   # 需要 npm login，且 peerDeps 只列 @earendil-works/*（host 提供）
+pi install npm:pi-retry-kit
+```
+
+> git tag 是**不可变**引用：`pi install git:...@v0.4.0` 会固定在该 tag。改代码后必须打**新 tag**（如 `v0.4.1`），不要原地改 tag。
 
 ## 开发
 
